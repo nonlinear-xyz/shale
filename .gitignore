@@ -1,0 +1,9 @@
+# Locally built binary. Releases come from goreleaser.
+/shale
+/dist/
+
+# Go
+*.test
+*.out
+
+.DS_Store

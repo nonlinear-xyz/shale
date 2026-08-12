@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      - run: go vet ./...
+      - run: gofmt -l . | tee /dev/stderr | (! read)
+        shell: bash
+      # CGO_ENABLED=0 is the invariant that keeps this a single static binary.
+      # Running the suite with it off means a dependency that quietly needs cgo
+      # fails here rather than at release time.
+      - run: CGO_ENABLED=0 go test -race ./...
+        env:
+          CGO_ENABLED: 0
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+      # Distribution is the whole thesis for picking Go. If a platform stops
+      # building, that is a release-blocking regression, not a warning.
+      - run: go build -o /dev/null ./...
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.target.goos }}
+          GOARCH: ${{ matrix.target.goarch }}

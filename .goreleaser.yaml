@@ -1,0 +1,46 @@
+version: 2
+
+project_name: shale
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: shale
+    main: ./cmd/shale
+    binary: shale
+    # CGO_ENABLED=0 is the invariant: one static binary per platform, built from
+    # one machine, with no cross-toolchain. The pure-Go SQLite driver exists so
+    # this stays true.
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X github.com/nonlinear-xyz/shale/internal/buildinfo.Version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [README.md, LICENSE]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  draft: true
