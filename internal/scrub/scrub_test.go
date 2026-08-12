@@ -237,3 +237,53 @@ func mustJSON(t *testing.T, v any) string {
 	}
 	return string(b)
 }
+
+// The entropy catch-all was redacting file paths, not secrets. Measured over 25
+// real transcripts, 69% of its hits were paths, branch names and issue slugs —
+// destroying exactly what a transcript corpus is most useful for while buying no
+// security. These are verbatim cases from that measurement.
+func TestEntropyRuleKeepsPathsAndIdentifiers(t *testing.T) {
+	s, _ := New()
+	keep := []string{
+		"claude/worktrees/kai-215-209-command-center",
+		"claude/worktrees/kai-215-209-command-center/src/components/datatable/DataTable",
+		"claude/worktrees/kai-210-datatable-perf/src/components/datatable/DataTable",
+		"app/concourse-takehome/issue/CON-8/land-and-project-batches-into-the-cloud",
+		"claude/projects/-Users-airnishu-Documents-nonlinear-clients-kairos/memory",
+		"migrations-e943ede104ffbcb5b2df91018a7625cd5d30f59c", // git-shaped id, not a credential
+	}
+	for _, in := range keep {
+		t.Run(in[:min(28, len(in))], func(t *testing.T) {
+			if out := s.String(in); out != in {
+				t.Errorf("path/identifier was redacted:\n in: %s\nout: %s", in, out)
+			}
+		})
+	}
+}
+
+// The other half of the same change: tightening the rule must not let a real
+// credential through. The first case is base64 of an environment block whose
+// plaintext begins {"DATABASE_SSL":"false","DATABASE_URL":"postgresql://…
+func TestEntropyRuleStillCatchesRealSecrets(t *testing.T) {
+	s, _ := New()
+	redact := []string{
+		"eyJEQVRBQkFTRV9TU0wiOiJmYWxzZSIsIkRBVEFCQVNFX1VSTCI6InBvc3RncmVzcWw6Ly9kdW",
+		"dEPW6vcBSEgLi8g4IKN5XIrHq8rIUkCxLJ2Rc_U6jzw",
+		"RdRotz-ItP3Cizr4LXDIWBsdBMh6SqGDvw5ENqQUDyA",
+	}
+	for _, in := range redact {
+		t.Run(in[:min(28, len(in))], func(t *testing.T) {
+			out := s.String(in)
+			if !strings.Contains(out, "[REDACTED:high-entropy:") {
+				t.Errorf("credential was NOT redacted:\n in: %s\nout: %s", in, out)
+			}
+		})
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

@@ -39,7 +39,12 @@ type Options struct {
 	DryRun  bool
 	// Force ignores both the settle window and the cursor. Used by an explicit
 	// single-file capture, where the caller already knows the session ended.
-	Force   bool
+	Force bool
+	// Rescan ignores the cursor but keeps the settle window. Needed whenever the
+	// scrub rules change: every stored transcript was redacted under the OLD rules
+	// and nothing else would ever re-offer it, so a corpus captured under a bug
+	// stays wrong forever.
+	Rescan  bool
 	Machine string
 	Now     time.Time
 }
@@ -118,7 +123,7 @@ func Sweep(ctx context.Context, db *store.DB, sc *scrub.Scrubber, opts Options) 
 					res.Skipped = append(res.Skipped, Skip{path, "not settled (written <30m ago)"})
 					continue
 				}
-				if mtimeMS <= cursor {
+				if !opts.Rescan && mtimeMS <= cursor {
 					continue // already offered on an earlier sweep
 				}
 			}

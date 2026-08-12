@@ -123,6 +123,7 @@ func cmdWatch(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
 	dryRun := fs.Bool("dry-run", false, "report what would be captured, touching nothing")
 	sourceFlag := fs.String("source", "all", "claude, codex, or all")
+	rescan := fs.Bool("rescan", false, "re-offer every settled session, ignoring the cursor (use after scrub rules change)")
 	verbose := fs.Bool("verbose", false, "print skip reasons")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -152,6 +153,7 @@ func cmdWatch(ctx context.Context, args []string) error {
 	res, err := watch.Sweep(ctx, db, sc, watch.Options{
 		Sources: srcs,
 		DryRun:  *dryRun,
+		Rescan:  *rescan,
 		Machine: machine.Label,
 	})
 	if err != nil {
