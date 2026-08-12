@@ -7,12 +7,23 @@ every agent session on your machine — whatever harness wrote it — keeps them
 local append-only store, and serves them back to any agent over MCP.
 
 ```sh
-shale repos      # what shale can see on this machine (no network, ever)
-shale init       # install the watcher, register the MCP server
-shale watch      # capture continuously
-shale mcp        # serve context over stdio MCP
-shale link       # optional: replicate to a hub for cross-machine joins
+shale repos              # what shale can see on this machine (no network, ever)
+shale watch              # capture settled sessions into the local store
+shale search <query>     # search your own corpus
+shale status             # what has been captured
+shale mcp                # serve context to agents over stdio MCP   (in progress)
+shale link               # replicate to a hub for cross-machine joins (in progress)
 ```
+
+Sessions are swept once they have been idle for 30 minutes — a quiet-file
+heuristic, not an end-of-session signal, so a long-running session may be
+captured before it ends and re-captured when it grows. `shale watch --dry-run`
+shows exactly what would be captured, and touches nothing.
+
+Search is lexical (FTS5, porter stemming, bm25). Exact identifiers, file names
+and error messages work best; `AND`/`OR`/`NOT` and `"quoted phrases"` work as
+you'd expect, and everything else is treated as a literal term — so `kai-214`
+and `C++` search for what you typed rather than erroring.
 
 ## What leaves your machine
 
@@ -59,8 +70,11 @@ in a sidecar, not here.
 
 ## Status
 
-Early. Repository discovery and the secret scrubber are ported and tested against
-the implementation they replace. Local capture, the event store, and the MCP
-server are in progress.
+Early, but the local loop works end to end: capture → store → search. On the
+author's machine that is 97 sessions across 19 repositories and a month of
+history.
+
+MCP serving and hub replication are next. Until `shale mcp` lands, your agent
+cannot read the corpus — only you can, through `shale search`.
 
 MIT.
