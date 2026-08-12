@@ -20,6 +20,54 @@ heuristic, not an end-of-session signal, so a long-running session may be
 captured before it ends and re-captured when it grows. `shale watch --dry-run`
 shows exactly what would be captured, and touches nothing.
 
+## Giving it to your agent
+
+**Claude Code:**
+
+```sh
+claude mcp add shale -s user -- shale mcp
+```
+
+**Codex:**
+
+```sh
+codex mcp add shale -- shale mcp
+```
+
+Both take an absolute path if `shale` is not on the PATH your editor inherits —
+a GUI-launched editor often does not see a PATH set in `.zshrc`, which surfaces
+as `Connection closed` rather than as `command not found`.
+
+Or commit a project-level `.mcp.json` for Claude Code:
+
+```json
+{ "mcpServers": { "shale": { "type": "stdio", "command": "shale", "args": ["mcp"] } } }
+```
+
+Two read-only tools, no mutation surface:
+
+- **`context_for_task`** — call at the start of work. Returns a bounded packet of
+  relevant prior passages plus things that went wrong when similar work was
+  attempted before. Every item carries provenance: source, repo, line range in
+  the stored transcript, and freshness.
+- **`search_evidence`** — a targeted keyword dig, optionally filtered to one repo
+  or to `kind: "error"`.
+
+A packet always reports **how** it retrieved (`match`, `match_or`, or
+`recency_fallback`) and **what it dropped** (`budget.truncated`), so an agent can
+weigh a fallback differently from an exact match and never mistakes a partial
+packet for a complete one.
+
+Add this to your `CLAUDE.md` to make the loop automatic:
+
+```markdown
+Before starting any nontrivial task, call `context_for_task` on the `shale`
+MCP server with a one-sentence description of what you're about to do.
+Treat `recency_fallback` packets with low confidence.
+```
+
+## Search
+
 Search is lexical (FTS5, porter stemming, bm25). Exact identifiers, file names
 and error messages work best; `AND`/`OR`/`NOT` and `"quoted phrases"` work as
 you'd expect, and everything else is treated as a literal term — so `kai-214`
@@ -70,11 +118,11 @@ in a sidecar, not here.
 
 ## Status
 
-Early, but the local loop works end to end: capture → store → search. On the
-author's machine that is 97 sessions across 19 repositories and a month of
-history.
+The local loop is closed: capture → store → search → serve. On the author's
+machine that is 94 sessions, 7,854 indexed passages, 17 repositories and a month
+of history, in a 27 MB database.
 
-MCP serving and hub replication are next. Until `shale mcp` lands, your agent
-cannot read the corpus — only you can, through `shale search`.
+Hub replication (`shale link`) is next — cross-machine and cross-person joins are
+the one thing that genuinely cannot be computed on a single laptop.
 
 MIT.

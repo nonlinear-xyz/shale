@@ -25,6 +25,7 @@ import (
 	"github.com/nonlinear-xyz/shale/internal/buildinfo"
 	"github.com/nonlinear-xyz/shale/internal/config"
 	"github.com/nonlinear-xyz/shale/internal/discover"
+	"github.com/nonlinear-xyz/shale/internal/mcp"
 	"github.com/nonlinear-xyz/shale/internal/render"
 	"github.com/nonlinear-xyz/shale/internal/scrub"
 	"github.com/nonlinear-xyz/shale/internal/sessions"
@@ -39,9 +40,10 @@ Usage:
   shale watch               capture settled agent sessions into the local store
   shale search <query>      search the local corpus
   shale status              what has been captured
+  shale mcp                 serve context to agents over stdio MCP
   shale version             print the build version
 
-Not built yet (in progress): mcp, link.
+Not built yet (in progress): link.
 
 Everything above is local. Nothing leaves this machine.
 
@@ -71,10 +73,12 @@ func main() {
 		err = cmdSearch(ctx, args)
 	case "status":
 		err = cmdStatus(ctx, args)
-	case "mcp", "link":
+	case "mcp":
+		err = cmdMCP(ctx, args)
+	case "link":
 		err = fmt.Errorf(
-			"`shale %s` is not built yet — this build captures and searches locally; "+
-				"MCP serving and hub replication land next", cmd)
+			"`shale link` is not built yet — this build is local-only; " +
+				"hub replication for cross-machine joins lands next")
 	case "version", "-v", "--version":
 		fmt.Printf("shale %s (%s)\n", buildinfo.Version, buildinfo.PlatformLabel())
 		return
@@ -235,6 +239,26 @@ func cmdSearch(ctx context.Context, args []string) error {
 	return nil
 }
 
+// cmdMCP serves the local corpus to an agent over stdio.
+//
+// STDOUT IS THE PROTOCOL. Nothing may be printed there but JSON-RPC frames, so
+// this command is silent on success and every diagnostic goes to stderr. A stray
+// fmt.Println here surfaces to the user as an unexplained MCP disconnect.
+func cmdMCP(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	db, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	srv := &mcp.Server{DB: db, Log: os.Stderr}
+	return srv.Serve(ctx, os.Stdin, os.Stdout)
+}
+
 func cmdStatus(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	if err := fs.Parse(args); err != nil {
@@ -260,6 +284,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 	fmt.Fprintf(tw, "store\t%s\n", dir)
 	fmt.Fprintf(tw, "sessions\t%d\n", st.Sessions)
 	fmt.Fprintf(tw, "repositories\t%d\n", st.Repos)
+	fmt.Fprintf(tw, "indexed chunks\t%d\n", st.Chunks)
 	if st.OldestAt != "" {
 		fmt.Fprintf(tw, "span\t%s → %s\n", st.OldestAt, st.NewestAt)
 	}

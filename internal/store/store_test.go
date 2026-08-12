@@ -18,7 +18,7 @@ func newTestDB(t *testing.T) *DB {
 
 func seed(t *testing.T, db *DB, hash, title, digest, repo string) {
 	t.Helper()
-	ok, err := db.PutSession(context.Background(), hash, SessionRecord{
+	_, ok, err := db.PutSession(context.Background(), hash, SessionRecord{
 		Source: "claude_code", SourceKey: hash, Title: title, Digest: digest,
 		Repo: repo, EndedAt: time.Now().UTC(),
 	})
@@ -100,7 +100,7 @@ func TestPutSessionIsIdempotentOnContentHash(t *testing.T) {
 	ctx := context.Background()
 	seed(t, db, "aaa", "one", "body", "acme/x")
 
-	ok, err := db.PutSession(ctx, "aaa", SessionRecord{
+	_, ok, err := db.PutSession(ctx, "aaa", SessionRecord{
 		Source: "claude_code", SourceKey: "aaa", Title: "one", Digest: "body", EndedAt: time.Now(),
 	})
 	if err != nil {

@@ -261,12 +261,33 @@ func captureOne(ctx context.Context, db *store.DB, sc *scrub.Scrubber, path stri
 		return outcomeCaptured, nil
 	}
 
-	inserted, err := db.PutSession(ctx, contentHash, rec)
+	seq, inserted, err := db.PutSession(ctx, contentHash, rec)
 	if err != nil {
 		return outcomeCaptured, err
 	}
 	if !inserted {
 		return outcomeDuplicate, nil
+	}
+
+	// Index the transcript body, not just the digest. The digest is what was asked
+	// and what broke — roughly 4% of what was captured. Everything the agent
+	// actually did lives in the chunks, and without them it is stored but
+	// unsearchable.
+	//
+	// Chunks are built from the SCRUBBED lines so line numbers point at the blob on
+	// disk, which is what makes a citation checkable.
+	if chunks := chunkRows(src, scrubbed); len(chunks) > 0 {
+		scope := rec.Repo
+		if scope == "" {
+			scope = rec.CWD
+		}
+		occurred := rec.EndedAt
+		if occurred.IsZero() {
+			occurred = time.Now().UTC()
+		}
+		if err := db.PutChunks(ctx, seq, string(src), scope, occurred.UTC().Format(time.RFC3339), chunks); err != nil {
+			return outcomeCaptured, fmt.Errorf("index chunks: %w", err)
+		}
 	}
 	// The blob is written AFTER the event commits. If this fails the event points
 	// at a missing blob, which `shale status` can detect and re-capture repairs —
@@ -275,6 +296,23 @@ func captureOne(ctx context.Context, db *store.DB, sc *scrub.Scrubber, path stri
 		return outcomeCaptured, fmt.Errorf("write blob: %w", err)
 	}
 	return outcomeCaptured, nil
+}
+
+// chunkRows extracts readable text from a transcript and groups it into
+// indexable windows.
+func chunkRows(src sessions.Source, scrubbed []string) []store.ChunkRow {
+	chunks := sessions.Chunks(sessions.Segments(src, scrubbed))
+	out := make([]store.ChunkRow, 0, len(chunks))
+	for _, c := range chunks {
+		out = append(out, store.ChunkRow{
+			Index:     c.Index,
+			LineStart: c.LineStart,
+			LineEnd:   c.LineEnd,
+			Kind:      string(c.Kind),
+			Text:      c.Text,
+		})
+	}
+	return out
 }
 
 // writeBlob stores the scrubbed transcript gzipped and content-addressed, written

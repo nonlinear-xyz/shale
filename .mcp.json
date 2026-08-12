@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "shale": {
+      "type": "stdio",
+      "command": "shale",
+      "args": ["mcp"]
+    }
+  }
+}

@@ -103,6 +103,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
   tokenize='porter unicode61'
 );
 
+-- Chunks: searchable windows over the transcript body, distinct from the digest.
+-- The digest is the session's summary (what was asked, what broke, how it
+-- ended); chunks are everything else, which is ~96% of what was captured and
+-- would otherwise be stored but invisible.
+--
+-- Metadata rides as UNINDEXED columns so a hit renders without a second query.
+-- kind separates errors, which drive a packet's corrections section.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+  body,
+  event_seq UNINDEXED, chunk_index UNINDEXED,
+  line_start UNINDEXED, line_end UNINDEXED, kind UNINDEXED,
+  source UNINDEXED, scope UNINDEXED, occurred_at UNINDEXED,
+  tokenize='porter unicode61'
+);
+
 -- Per-source replication and sweep watermarks. Deliberately NOT in events: a
 -- cursor is mutable state about the log, not a fact that happened.
 CREATE TABLE IF NOT EXISTS cursors (
@@ -147,26 +162,26 @@ type SessionRecord struct {
 // different hash and is appended as a new event — the log keeps both, because
 // "what did this session look like at 3pm" is a real question once a hub is
 // joining across machines.
-func (d *DB) PutSession(ctx context.Context, contentHash string, rec SessionRecord) (inserted bool, err error) {
+func (d *DB) PutSession(ctx context.Context, contentHash string, rec SessionRecord) (seq int64, inserted bool, err error) {
 	var exists int
 	err = d.sql.QueryRowContext(ctx,
 		`SELECT count(*) FROM events WHERE content_hash = ? AND kind = ?`,
 		contentHash, KindSessionCaptured).Scan(&exists)
 	if err != nil {
-		return false, fmt.Errorf("dedupe check: %w", err)
+		return 0, false, fmt.Errorf("dedupe check: %w", err)
 	}
 	if exists > 0 {
-		return false, nil
+		return 0, false, nil
 	}
 
 	payload, err := json.Marshal(rec)
 	if err != nil {
-		return false, fmt.Errorf("encode payload: %w", err)
+		return 0, false, fmt.Errorf("encode payload: %w", err)
 	}
 
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
 	defer tx.Rollback()
 
@@ -186,11 +201,11 @@ func (d *DB) PutSession(ctx context.Context, contentHash string, rec SessionReco
 		occurred.UTC().Format(time.RFC3339), scope, d.BlobPath(contentHash), contentHash, string(payload),
 	)
 	if err != nil {
-		return false, fmt.Errorf("insert event: %w", err)
+		return 0, false, fmt.Errorf("insert event: %w", err)
 	}
-	seq, err := res.LastInsertId()
+	seq, err = res.LastInsertId()
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
 
 	if _, err := tx.ExecContext(ctx, `
@@ -198,10 +213,185 @@ func (d *DB) PutSession(ctx context.Context, contentHash string, rec SessionReco
 		VALUES (?, ?, ?, ?, ?, ?)`,
 		rec.Title, rec.Digest, seq, rec.Source, scope, occurred.UTC().Format(time.RFC3339),
 	); err != nil {
-		return false, fmt.Errorf("index: %w", err)
+		return 0, false, fmt.Errorf("index: %w", err)
 	}
 
-	return true, tx.Commit()
+	return seq, true, tx.Commit()
+}
+
+// ChunkRow is one indexable window over a transcript, as the store sees it.
+type ChunkRow struct {
+	Index     int
+	LineStart int
+	LineEnd   int
+	Kind      string
+	Text      string
+}
+
+// PutChunks indexes a session's chunks against its event.
+//
+// Called inside the same capture that wrote the event, so a session is either
+// fully indexed or not present. Chunks are keyed to event_seq rather than to the
+// content hash because a grown session produces a NEW event, and its chunks must
+// not collide with the earlier version's.
+func (d *DB) PutChunks(ctx context.Context, eventSeq int64, source, scope, occurredAt string, chunks []ChunkRow) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO chunks_fts (body, event_seq, chunk_index, line_start, line_end, kind, source, scope, occurred_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, c := range chunks {
+		if _, err := stmt.ExecContext(ctx, c.Text, eventSeq, c.Index,
+			c.LineStart, c.LineEnd, c.Kind, source, scope, occurredAt); err != nil {
+			return fmt.Errorf("index chunk %d: %w", c.Index, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// ChunkHit is one chunk-level search result, carrying enough provenance to point
+// back at exact bytes in the blob on disk.
+type ChunkHit struct {
+	EventSeq   int64
+	ChunkIndex int
+	LineStart  int
+	LineEnd    int
+	Kind       string
+	Source     string
+	Scope      string
+	OccurredAt string
+	Body       string
+	Excerpt    string
+	Score      float64
+	// Adjacent marks a chunk pulled in by window expansion rather than by matching
+	// the query itself. An agent is told the difference so it can weight them.
+	Adjacent bool
+}
+
+// Ref is the citation form used in packets: "chunk:<eventSeq>:<chunkIndex>".
+func (h ChunkHit) Ref() string {
+	return fmt.Sprintf("chunk:%d:%d", h.EventSeq, h.ChunkIndex)
+}
+
+// SearchChunks runs FTS over transcript bodies.
+//
+// kind filters to errors only when set to "error", which is how a packet builds
+// its corrections section — the question "what went wrong when we tried this
+// before" is worth asking separately from "what do we know about this".
+func (d *DB) SearchChunks(ctx context.Context, query, repo, kind string, limit int) ([]ChunkHit, error) {
+	if limit <= 0 {
+		limit = 12
+	}
+	match := BuildMatchQuery(query)
+	if match == "" {
+		return nil, nil
+	}
+
+	sqlText := `
+		SELECT event_seq, chunk_index, line_start, line_end, kind, source, scope, occurred_at,
+		       body, snippet(chunks_fts, 0, '', '', ' … ', 28) AS excerpt, bm25(chunks_fts) AS score
+		FROM chunks_fts
+		WHERE chunks_fts MATCH ?`
+	args := []any{match}
+	if repo != "" {
+		sqlText += ` AND scope = ?`
+		args = append(args, repo)
+	}
+	if kind != "" {
+		sqlText += ` AND kind = ?`
+		args = append(args, kind)
+	}
+	sqlText += ` ORDER BY score LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := d.sql.QueryContext(ctx, sqlText, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search chunks: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ChunkHit
+	for rows.Next() {
+		var h ChunkHit
+		var scope, occurred sql.NullString
+		if err := rows.Scan(&h.EventSeq, &h.ChunkIndex, &h.LineStart, &h.LineEnd, &h.Kind,
+			&h.Source, &scope, &occurred, &h.Body, &h.Excerpt, &h.Score); err != nil {
+			return nil, err
+		}
+		h.Scope, h.OccurredAt = scope.String, occurred.String
+		h.Score = -h.Score
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// ExpandWindow pulls the chunks immediately before and after each hit.
+//
+// Retrieval finds the chunk containing the match, but the sentence that explains
+// it is often in the neighbour — a decision is stated in one window and its
+// reason in the next. Without expansion, evidence reads as disconnected
+// fragments; with it, as passages.
+//
+// Adjacent chunks inherit a fraction of their anchor's score so they rank near it
+// without displacing genuine matches, and are flagged Adjacent so the agent knows
+// which chunks actually matched.
+func (d *DB) ExpandWindow(ctx context.Context, hits []ChunkHit, factor float64) ([]ChunkHit, error) {
+	seen := map[string]bool{}
+	for _, h := range hits {
+		seen[h.Ref()] = true
+	}
+
+	out := append([]ChunkHit(nil), hits...)
+	for _, h := range hits {
+		for _, idx := range []int{h.ChunkIndex - 1, h.ChunkIndex + 1} {
+			if idx < 0 {
+				continue
+			}
+			ref := fmt.Sprintf("chunk:%d:%d", h.EventSeq, idx)
+			if seen[ref] {
+				continue
+			}
+			var n ChunkHit
+			var scope, occurred sql.NullString
+			err := d.sql.QueryRowContext(ctx, `
+				SELECT event_seq, chunk_index, line_start, line_end, kind, source, scope, occurred_at, body
+				FROM chunks_fts WHERE event_seq = ? AND chunk_index = ?`, h.EventSeq, idx).
+				Scan(&n.EventSeq, &n.ChunkIndex, &n.LineStart, &n.LineEnd, &n.Kind,
+					&n.Source, &scope, &occurred, &n.Body)
+			if err == sql.ErrNoRows {
+				continue
+			}
+			if err != nil {
+				return out, err
+			}
+			n.Scope, n.OccurredAt = scope.String, occurred.String
+			n.Score = h.Score * factor
+			n.Adjacent = true
+			n.Excerpt = firstChars(n.Body, 280)
+			seen[ref] = true
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+func firstChars(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + " …"
 }
 
 // HasContent reports whether this exact content hash is already in the log. Used
@@ -365,6 +555,7 @@ type Stats struct {
 	Events     int
 	Sessions   int
 	Repos      int
+	Chunks     int
 	OldestAt   string
 	NewestAt   string
 	TotalTurns int
@@ -377,9 +568,10 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 		  (SELECT count(*) FROM events),
 		  (SELECT count(*) FROM events WHERE kind = ?),
 		  (SELECT count(DISTINCT scope) FROM events WHERE scope IS NOT NULL AND scope != ''),
+		  (SELECT count(*) FROM chunks_fts),
 		  (SELECT coalesce(min(occurred_at), '') FROM events),
 		  (SELECT coalesce(max(occurred_at), '') FROM events)`,
 		KindSessionCaptured,
-	).Scan(&s.Events, &s.Sessions, &s.Repos, &s.OldestAt, &s.NewestAt)
+	).Scan(&s.Events, &s.Sessions, &s.Repos, &s.Chunks, &s.OldestAt, &s.NewestAt)
 	return s, err
 }
