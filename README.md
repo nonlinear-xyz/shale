@@ -142,7 +142,17 @@ skipped, one for something that failed. It degrades explicitly at 256 and 16
 colours rather than by nearest-match, which collapsed *skipped* and *failed* onto
 the same red.
 
-`shale mcp` emits no styling at all: stdout there is the JSON-RPC transport.
+`shale mcp` emits no styling at all: stdout there is the JSON-RPC transport, and
+a test runs the real binary with colour forced on to prove it stays pure.
+
+**If an agent shells out to shale**, nothing changes when the harness pipes the
+output — which is the normal case, and what Claude Code's Bash tool does. If your
+harness allocates a PTY instead, pass `--no-color` (or set `NO_COLOR=1`) so the
+agent reads prose rather than escape sequences. One caveat there: Bubble Tea v1
+queries the terminal's background colour from a package `init()`, before `main`
+runs, so on a PTY three escape bytes precede the output of every command no
+matter what flags are passed. It is upstream, documented as removed in Bubble
+Tea v2, and does not affect MCP or piped output.
 
 ## What leaves your machine
 

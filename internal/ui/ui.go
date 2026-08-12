@@ -166,7 +166,33 @@ type Theme struct {
 // its plain text. That is why `shale search | grep` needs no special case —
 // there is nothing to strip, because nothing was ever emitted.
 func New(w io.Writer) *Theme {
-	return themeFrom(lipgloss.NewRenderer(w))
+	r := lipgloss.NewRenderer(w)
+
+	// Pin the background when there is no color to pick, instead of letting
+	// lipgloss work it out.
+	//
+	// Resolving an adaptive color asks the renderer HasDarkBackground(), and
+	// lipgloss asks that BEFORE it checks the profile — so even at the ascii
+	// profile, where the answer cannot change the output, termenv writes an
+	// OSC 11 background query plus a cursor-position report to the terminal and
+	// blocks waiting for the reply. Measured under a PTY with NO_COLOR set,
+	// that put `\x1b]11;?\x1b\\\x1b[6n` at the head of otherwise plain output
+	// and cost a round trip per command. An agent shelling out to shale reads
+	// that as content. NO_COLOR must mean zero escape bytes, not "no color plus
+	// a handshake".
+	if r.ColorProfile() == termenv.Ascii {
+		r.SetHasDarkBackground(true)
+	}
+	return themeFrom(r)
+}
+
+// NoColor builds a theme for a writer that IS a terminal but must not be
+// styled — an agent shelling out under a PTY, or an explicit --no-color.
+func NoColor(w io.Writer) *Theme {
+	r := lipgloss.NewRenderer(w)
+	r.SetColorProfile(termenv.Ascii)
+	r.SetHasDarkBackground(true) // pinned: see New
+	return themeFrom(r)
 }
 
 // Plain builds a theme that emits no escape sequences at all, whatever the

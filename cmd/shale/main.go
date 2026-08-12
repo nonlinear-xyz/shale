@@ -54,7 +54,10 @@ Not built yet (in progress): link.
 Everything above is local. Nothing leaves this machine.
 
 Colour follows the terminal: piped, redirected, or NO_COLOR set, every command
-above prints plain text. Run "shale <command> -h" for command flags.
+above prints plain text. Pass --no-color to force it — useful when an agent
+shells out to shale through a PTY, where shale cannot tell it is not a person.
+
+Run "shale <command> -h" for command flags.
 `
 
 func main() {
@@ -67,7 +70,7 @@ func main() {
 	// terminals, because the program reads one and draws to the other.
 	cmd, args := "browse", []string(nil)
 	if len(os.Args) >= 2 {
-		cmd, args = os.Args[1], os.Args[2:]
+		cmd, args = os.Args[1], stripGlobalFlags(os.Args[2:])
 	} else if !interactive() {
 		fmt.Print(usage)
 		os.Exit(2)
@@ -478,7 +481,34 @@ func cmdStatus(ctx context.Context, args []string) error {
 // resolving an adaptive color against a real terminal makes termenv write an
 // OSC background-color query into it and block waiting for a reply. Use
 // ui.Plain() if that path ever needs styling for stderr diagnostics.
-func theme() *ui.Theme { return ui.New(os.Stdout) }
+func theme() *ui.Theme {
+	if noColor {
+		return ui.NoColor(os.Stdout)
+	}
+	return ui.New(os.Stdout)
+}
+
+// noColor is set by the global --no-color flag. It is global rather than a
+// per-command flag because it is a property of the caller, not of the command:
+// an agent shelling out wants every shale invocation plain, and should not have
+// to know which subcommands happen to print styled output.
+var noColor bool
+
+// stripGlobalFlags pulls --no-color out of the argument list before the
+// per-command FlagSet sees it, so it can be passed to any subcommand without
+// each one having to declare it.
+func stripGlobalFlags(args []string) []string {
+	out := args[:0:0]
+	for _, a := range args {
+		switch a {
+		case "--no-color", "-no-color":
+			noColor = true
+		default:
+			out = append(out, a)
+		}
+	}
+	return out
+}
 
 // interactive reports whether there is a real terminal on both ends. Bubble Tea
 // needs stdin to read keys and stdout to draw; either one being a pipe means
