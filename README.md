@@ -7,10 +7,12 @@ every agent session on your machine — whatever harness wrote it — keeps them
 local append-only store, and serves them back to any agent over MCP.
 
 ```sh
+shale                    # open the browser
 shale repos              # what shale can see on this machine (no network, ever)
 shale watch              # capture settled sessions into the local store
 shale search <query>     # search your own corpus
 shale show <ref>         # read the passage or session a result cites
+shale browse             # search, read and audit interactively
 shale status             # what has been captured
 shale mcp                # serve context to agents over stdio MCP   (in progress)
 shale link               # replicate to a hub for cross-machine joins (in progress)
@@ -92,6 +94,55 @@ $ shale show session:1 --lines 40,90
 `--kind error`, `--repo owner/name` and `--since <days>` narrow a search the same
 way the MCP tools do; the CLI and the MCP server read the same chunk index, so
 they cannot give you different answers to the same question.
+
+## Browsing
+
+`shale search` and `shale show` are the same act performed twice — search, read
+an excerpt, copy a ref, run `show`, find it was the wrong passage, start again.
+`shale browse` collapses that loop into one screen: results narrow as you type,
+and the transcript on the right opens on the matched line with its context above
+it.
+
+```
+ Search   Sessions   Repos   Status                                       shale
+────────────────────────────────────────────────────────────────────────────────
+  search  worktree
+╭──────────────────────────────────╮╭────────────────────────────────────────────╮
+│ │ kairos: indexing the codebase  ││                   | grep -v node_modules   │
+│ │ claude_code · kairos-app · 08-10││ ▸    36 output    === .claude/ ===         │
+│   observatory: merged branches   ││                   .claude/settings.json    │
+╰──────────────────────────────────╯╰────────────────────────────────────────────╯
+ shale show chunk:45:5           tab pane  ↑↓ results  enter read  ctrl+c quit
+```
+
+Bare `shale` opens it too — but only when stdin and stdout are both terminals.
+Piped or redirected, bare `shale` still prints usage and exits 2, so scripts that
+relied on that keep working.
+
+Four tabs: **Search**, **Sessions** (everything captured, newest first), **Repos**
+(what discovery found and what it skipped — the same audit surface as `shale
+repos`, with `a` to add a scan root and `r` to rescan), and **Status**.
+
+The ref stays on the status bar throughout, because it is what this surface
+exports: paste it into `shale show`, a commit message, or an agent prompt.
+
+This is additive. `shale search` remains a print-and-exit command so it can be
+piped, grepped and scripted — both read the same index.
+
+## Colour
+
+Colour follows the terminal. Piped, redirected, or with `NO_COLOR` set, every
+command prints exactly the plain text it always did — there is nothing to strip,
+because nothing is emitted. `shale search | grep` is unaffected.
+
+The palette is sampled off a shale cobble beach — slate greys, sea-slate blues,
+terracotta, ochre and iron red — and assigned by meaning rather than by hue: one
+colour for a ref you can follow, one for the term that matched, one for something
+skipped, one for something that failed. It degrades explicitly at 256 and 16
+colours rather than by nearest-match, which collapsed *skipped* and *failed* onto
+the same red.
+
+`shale mcp` emits no styling at all: stdout there is the JSON-RPC transport.
 
 ## What leaves your machine
 

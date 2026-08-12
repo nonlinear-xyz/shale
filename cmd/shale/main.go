@@ -21,8 +21,9 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"text/tabwriter"
 
+	"github.com/mattn/go-isatty"
+	"github.com/nonlinear-xyz/shale/internal/browse"
 	"github.com/nonlinear-xyz/shale/internal/buildinfo"
 	"github.com/nonlinear-xyz/shale/internal/config"
 	"github.com/nonlinear-xyz/shale/internal/discover"
@@ -31,16 +32,19 @@ import (
 	"github.com/nonlinear-xyz/shale/internal/scrub"
 	"github.com/nonlinear-xyz/shale/internal/sessions"
 	"github.com/nonlinear-xyz/shale/internal/store"
+	"github.com/nonlinear-xyz/shale/internal/ui"
 	"github.com/nonlinear-xyz/shale/internal/watch"
 )
 
 const usage = `shale — local memory for coding agents
 
 Usage:
+  shale                     open the browser (same as "shale browse")
   shale repos               list git repositories found on this machine (local only)
   shale watch               capture settled agent sessions into the local store
   shale search <query>      search the local corpus
   shale show <ref>          print the passage or session a ref names
+  shale browse              search, read and audit interactively
   shale status              what has been captured
   shale mcp                 serve context to agents over stdio MCP
   shale version             print the build version
@@ -49,17 +53,25 @@ Not built yet (in progress): link.
 
 Everything above is local. Nothing leaves this machine.
 
-Run "shale <command> -h" for command flags.
+Colour follows the terminal: piped, redirected, or NO_COLOR set, every command
+above prints plain text. Run "shale <command> -h" for command flags.
 `
 
 func main() {
-	if len(os.Args) < 2 {
+	// Bare `shale` opens the browser — but only with a terminal to draw on.
+	//
+	// The guard is the whole point. Bare `shale` already had a meaning: print
+	// usage, exit 2. Scripts and CI depend on that, and an alternate-screen TUI
+	// launched into a pipe either hangs waiting on a keyboard that is not there
+	// or floods the redirect with cursor escapes. Both stdin and stdout must be
+	// terminals, because the program reads one and draws to the other.
+	cmd, args := "browse", []string(nil)
+	if len(os.Args) >= 2 {
+		cmd, args = os.Args[1], os.Args[2:]
+	} else if !interactive() {
 		fmt.Print(usage)
 		os.Exit(2)
 	}
-
-	cmd := os.Args[1]
-	args := os.Args[2:]
 
 	// Ctrl-C cancels in-flight work cleanly.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -75,6 +87,8 @@ func main() {
 		err = cmdSearch(ctx, args)
 	case "show":
 		err = cmdShow(ctx, args)
+	case "browse":
+		err = cmdBrowse(ctx, args)
 	case "status":
 		err = cmdStatus(ctx, args)
 	case "mcp":
@@ -122,8 +136,35 @@ func cmdRepos(args []string) error {
 	if err != nil {
 		return err
 	}
-	render.RepoTable(os.Stdout, discover.Discover(roots, *depth), *showAll)
+	render.RepoTable(os.Stdout, theme(), discover.Discover(roots, *depth), *showAll)
 	return nil
+}
+
+// cmdBrowse is the interactive surface over the same index the other commands
+// read. It is additive: nothing above changes behaviour because this exists.
+func cmdBrowse(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("browse", flag.ExitOnError)
+	rootsFlag := fs.String("root", "", "comma-separated roots for the Repos tab (default: home directory)")
+	depth := fs.Int("depth", discover.DefaultMaxDepth, "maximum directory depth below each root")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	roots, err := resolveRoots(*rootsFlag)
+	if err != nil {
+		return err
+	}
+
+	dir, err := config.StateDir()
+	if err != nil {
+		return err
+	}
+	db, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	return browse.Run(ctx, db, theme(), dir, roots, *depth)
 }
 
 // cmdWatch sweeps settled transcripts into the local store.
@@ -168,26 +209,30 @@ func cmdWatch(ctx context.Context, args []string) error {
 		return err
 	}
 
+	th := theme()
 	verb := "captured"
 	if *dryRun {
 		verb = "would capture"
 	}
-	fmt.Printf("scanned %d, %s %d\n", res.Scanned, verb, res.Captured)
+	fmt.Printf("scanned %d, %s %s\n", res.Scanned, verb, th.Success.Render(fmt.Sprint(res.Captured)))
 	if res.Backfilled > 0 {
 		fmt.Printf("backfilled chunk index for %d already-captured session%s\n",
 			res.Backfilled, plural(res.Backfilled))
 	}
 
+	// Redactions are reported in Warn, not Success. A secret found in a
+	// transcript is a thing that happened, not a job well done.
 	if redactions := sc.Total(); redactions > 0 {
-		fmt.Printf("redacted %d secret%s: %s\n", redactions, plural(redactions), formatCounts(sc.Counts()))
+		fmt.Println(th.Warn.Render(fmt.Sprintf("redacted %d secret%s: %s",
+			redactions, plural(redactions), formatCounts(sc.Counts()))))
 	}
 
 	if *verbose || *dryRun {
 		for _, s := range res.Skipped {
-			fmt.Printf("  skip %s — %s\n", shortName(s.Path), s.Reason)
+			fmt.Printf("  skip %s — %s\n", th.Facts.Render(shortName(s.Path)), th.Warn.Render(s.Reason))
 		}
 	} else if n := len(res.Skipped); n > 0 {
-		fmt.Printf("skipped %d (run with --verbose for reasons)\n", n)
+		fmt.Println(th.Hint.Render(fmt.Sprintf("skipped %d (run with --verbose for reasons)", n)))
 	}
 
 	for _, e := range res.Errors {
@@ -255,7 +300,7 @@ func cmdSearch(ctx context.Context, args []string) error {
 		return err
 	}
 
-	render.SearchResults(os.Stdout, query, hits, sessions)
+	render.SearchResults(os.Stdout, theme(), query, hits, sessions)
 	return nil
 }
 
@@ -306,7 +351,7 @@ func cmdShow(ctx context.Context, args []string) error {
 	}
 
 	segs := sessions.Segments(sessions.Source(info.Source), blob)
-	render.Transcript(os.Stdout, info, segs, lineStart, lineEnd, len(blob))
+	render.Transcript(os.Stdout, theme(), info, segs, lineStart, lineEnd, len(blob))
 	return nil
 }
 
@@ -403,24 +448,44 @@ func cmdStatus(ctx context.Context, args []string) error {
 		return err
 	}
 
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "store\t%s\n", dir)
-	fmt.Fprintf(tw, "sessions\t%d\n", st.Sessions)
-	fmt.Fprintf(tw, "repositories\t%d\n", st.Repos)
-	fmt.Fprintf(tw, "indexed chunks\t%d\n", st.Chunks)
-	if st.OldestAt != "" {
-		fmt.Fprintf(tw, "span\t%s → %s\n", st.OldestAt, st.NewestAt)
+	th := theme()
+	rows := [][2]string{
+		{"store", dir},
+		{"sessions", fmt.Sprint(st.Sessions)},
+		{"repositories", fmt.Sprint(st.Repos)},
+		{"indexed chunks", fmt.Sprint(st.Chunks)},
 	}
-	tw.Flush()
+	if st.OldestAt != "" {
+		rows = append(rows, [2]string{"span", st.OldestAt + " → " + st.NewestAt})
+	}
+	render.StatusTable(os.Stdout, th, rows)
 
 	if st.Sessions == 0 {
-		fmt.Println("\nNothing captured yet. Run `shale watch`.")
-		fmt.Println("Sessions must be idle for 30 minutes before they are swept.")
+		fmt.Println("\n" + th.Warn.Render("Nothing captured yet. Run `shale watch`."))
+		fmt.Println(th.Hint.Render("Sessions must be idle for 30 minutes before they are swept."))
 	}
 	return nil
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+// theme builds the style set against stdout, which is what makes color
+// automatic and piping safe: termenv reads the profile off the writer, so a
+// redirect, a dumb terminal or NO_COLOR all resolve to plain text with no
+// special case at any call site.
+//
+// Never call this from cmdMCP. Stdout there is the JSON-RPC transport, and
+// resolving an adaptive color against a real terminal makes termenv write an
+// OSC background-color query into it and block waiting for a reply. Use
+// ui.Plain() if that path ever needs styling for stderr diagnostics.
+func theme() *ui.Theme { return ui.New(os.Stdout) }
+
+// interactive reports whether there is a real terminal on both ends. Bubble Tea
+// needs stdin to read keys and stdout to draw; either one being a pipe means
+// this invocation is part of a script, not a session with a person.
+func interactive() bool {
+	return isatty.IsTerminal(os.Stdin.Fd()) && isatty.IsTerminal(os.Stdout.Fd())
+}
 
 func openStore() (*store.DB, error) {
 	dir, err := config.StateDir()

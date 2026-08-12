@@ -495,6 +495,50 @@ func (d *DB) Sessions(ctx context.Context, seqs []int64) (map[int64]SessionInfo,
 	return out, rows.Err()
 }
 
+// RecentSessions lists captured sessions newest first.
+//
+// Distinct from RecentChunks, which answers "what passages are recent" for a
+// retrieval fallback. This answers "what did I work on", which is the question
+// an interactive browser opens on — the corpus as a list of sessions, not as a
+// bag of windows over them.
+func (d *DB) RecentSessions(ctx context.Context, repo string, limit int) ([]SessionInfo, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	sqlText := `
+		SELECT seq, source, scope, occurred_at, content_hash, payload
+		FROM events WHERE kind = ?`
+	args := []any{KindSessionCaptured}
+	if repo != "" {
+		sqlText += ` AND scope = ?`
+		args = append(args, repo)
+	}
+	sqlText += ` ORDER BY occurred_at DESC, seq DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := d.sql.QueryContext(ctx, sqlText, args...)
+	if err != nil {
+		return nil, fmt.Errorf("recent sessions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []SessionInfo
+	for rows.Next() {
+		var s SessionInfo
+		var scope, hash sql.NullString
+		var payload string
+		if err := rows.Scan(&s.Seq, &s.Source, &scope, &s.OccurredAt, &hash, &payload); err != nil {
+			return nil, err
+		}
+		s.Scope, s.ContentHash = scope.String, hash.String
+		// As in Sessions: a session whose payload will not decode still has usable
+		// identity, so keep it rather than failing the whole listing.
+		_ = json.Unmarshal([]byte(payload), &s.Record)
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // Chunk loads one indexed passage by ref.
 func (d *DB) Chunk(ctx context.Context, eventSeq int64, chunkIndex int) (ChunkHit, error) {
 	var h ChunkHit
