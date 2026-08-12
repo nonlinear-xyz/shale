@@ -155,23 +155,42 @@ type SessionRecord struct {
 	Extra      map[string]string `json:"extra,omitempty"`
 }
 
-// PutSession appends a session.captured event and indexes it for search.
+// ChunkRow is one indexable window over a transcript, as the store sees it.
+type ChunkRow struct {
+	Index     int
+	LineStart int
+	LineEnd   int
+	Kind      string
+	Text      string
+}
+
+// PutSession writes a session.captured event, its digest index and its chunks in
+// ONE transaction.
 //
-// Idempotent on content_hash: re-capturing an unchanged session is a no-op, which
-// is what makes the sweep safe to run as often as you like. A GROWN session has a
-// different hash and is appended as a new event — the log keeps both, because
-// "what did this session look like at 3pm" is a real question once a hub is
-// joining across machines.
-func (d *DB) PutSession(ctx context.Context, contentHash string, rec SessionRecord) (seq int64, inserted bool, err error) {
-	var exists int
+// Atomicity here is not fastidiousness. Committing the event separately from its
+// chunks means a crash between the two leaves a session that looks captured but
+// can never be searched — and because dedupe is keyed on content hash, the sweep
+// never offers that file again. The corpus silently loses a session, with no
+// error anywhere.
+//
+// On a duplicate content hash this returns the EXISTING seq with inserted=false,
+// rather than zero. That is what makes repair possible: the caller can ask whether
+// the already-stored session has chunks and backfill it if not. Returning zero was
+// the bug that left everything captured by an older build permanently unindexed —
+// an upgrade could not see the corpus it was installed to search.
+//
+// A GROWN session has a different hash and is appended as a new event. The log
+// keeps both, because "what did this session look like at 3pm" is a real question
+// once a hub is joining across machines.
+func (d *DB) PutSession(ctx context.Context, contentHash string, rec SessionRecord, chunks []ChunkRow) (seq int64, inserted bool, err error) {
 	err = d.sql.QueryRowContext(ctx,
-		`SELECT count(*) FROM events WHERE content_hash = ? AND kind = ?`,
-		contentHash, KindSessionCaptured).Scan(&exists)
-	if err != nil {
+		`SELECT seq FROM events WHERE content_hash = ? AND kind = ? LIMIT 1`,
+		contentHash, KindSessionCaptured).Scan(&seq)
+	switch {
+	case err == nil:
+		return seq, false, nil // already stored — the caller decides whether to repair
+	case err != sql.ErrNoRows:
 		return 0, false, fmt.Errorf("dedupe check: %w", err)
-	}
-	if exists > 0 {
-		return 0, false, nil
 	}
 
 	payload, err := json.Marshal(rec)
@@ -193,12 +212,13 @@ func (d *DB) PutSession(ctx context.Context, contentHash string, rec SessionReco
 	if occurred.IsZero() {
 		occurred = time.Now().UTC()
 	}
+	stamp := occurred.UTC().Format(time.RFC3339)
 
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO events (id, kind, source, actor, occurred_at, scope, pointer, content_hash, payload)
 		VALUES (?, ?, ?, 'agent', ?, ?, ?, ?, ?)`,
 		contentHash+":"+rec.SourceKey, KindSessionCaptured, rec.Source,
-		occurred.UTC().Format(time.RFC3339), scope, d.BlobPath(contentHash), contentHash, string(payload),
+		stamp, scope, d.BlobPath(contentHash), contentHash, string(payload),
 	)
 	if err != nil {
 		return 0, false, fmt.Errorf("insert event: %w", err)
@@ -211,29 +231,24 @@ func (d *DB) PutSession(ctx context.Context, contentHash string, rec SessionReco
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO events_fts (title, body, seq, source, scope, occurred_at)
 		VALUES (?, ?, ?, ?, ?, ?)`,
-		rec.Title, rec.Digest, seq, rec.Source, scope, occurred.UTC().Format(time.RFC3339),
+		rec.Title, rec.Digest, seq, rec.Source, scope, stamp,
 	); err != nil {
-		return 0, false, fmt.Errorf("index: %w", err)
+		return 0, false, fmt.Errorf("index digest: %w", err)
+	}
+
+	if err := insertChunks(ctx, tx, seq, rec.Source, scope, stamp, chunks); err != nil {
+		return 0, false, err
 	}
 
 	return seq, true, tx.Commit()
 }
 
-// ChunkRow is one indexable window over a transcript, as the store sees it.
-type ChunkRow struct {
-	Index     int
-	LineStart int
-	LineEnd   int
-	Kind      string
-	Text      string
-}
-
-// PutChunks indexes a session's chunks against its event.
+// PutChunks indexes chunks against an existing event — the repair path, used for
+// a session stored before chunking existed or one whose indexing was interrupted.
 //
-// Called inside the same capture that wrote the event, so a session is either
-// fully indexed or not present. Chunks are keyed to event_seq rather than to the
-// content hash because a grown session produces a NEW event, and its chunks must
-// not collide with the earlier version's.
+// Idempotent: existing chunks for the event are cleared first. A repair that
+// appended would silently degrade ranking, since the same passage would outrank
+// everything else merely by appearing several times.
 func (d *DB) PutChunks(ctx context.Context, eventSeq int64, source, scope, occurredAt string, chunks []ChunkRow) error {
 	if len(chunks) == 0 {
 		return nil
@@ -244,21 +259,41 @@ func (d *DB) PutChunks(ctx context.Context, eventSeq int64, source, scope, occur
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO chunks_fts (body, event_seq, chunk_index, line_start, line_end, kind, source, scope, occurred_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chunks_fts WHERE event_seq = ?`, eventSeq); err != nil {
+		return fmt.Errorf("clear chunks: %w", err)
+	}
+	if err := insertChunks(ctx, tx, eventSeq, source, scope, occurredAt, chunks); err != nil {
 		return err
 	}
-	defer stmt.Close()
+	return tx.Commit()
+}
 
+// execer is satisfied by both *sql.DB and *sql.Tx so chunk insertion can run
+// inside the capture transaction or standalone during a repair.
+type execer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertChunks(ctx context.Context, x execer, eventSeq int64, source, scope, occurredAt string, chunks []ChunkRow) error {
 	for _, c := range chunks {
-		if _, err := stmt.ExecContext(ctx, c.Text, eventSeq, c.Index,
-			c.LineStart, c.LineEnd, c.Kind, source, scope, occurredAt); err != nil {
+		if _, err := x.ExecContext(ctx, `
+			INSERT INTO chunks_fts (body, event_seq, chunk_index, line_start, line_end, kind, source, scope, occurred_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			c.Text, eventSeq, c.Index, c.LineStart, c.LineEnd, c.Kind, source, scope, occurredAt); err != nil {
 			return fmt.Errorf("index chunk %d: %w", c.Index, err)
 		}
 	}
-	return tx.Commit()
+	return nil
+}
+
+// ChunkCount reports how many chunks are indexed for an event. Zero on an event
+// that exists is exactly the upgrade case: captured by an older build, never
+// indexed, invisible to search until backfilled.
+func (d *DB) ChunkCount(ctx context.Context, eventSeq int64) (int, error) {
+	var n int
+	err := d.sql.QueryRowContext(ctx,
+		`SELECT count(*) FROM chunks_fts WHERE event_seq = ?`, eventSeq).Scan(&n)
+	return n, err
 }
 
 // ChunkHit is one chunk-level search result, carrying enough provenance to point
@@ -290,7 +325,7 @@ func (h ChunkHit) Ref() string {
 // kind filters to errors only when set to "error", which is how a packet builds
 // its corrections section — the question "what went wrong when we tried this
 // before" is worth asking separately from "what do we know about this".
-func (d *DB) SearchChunks(ctx context.Context, query, repo, kind string, limit int) ([]ChunkHit, error) {
+func (d *DB) SearchChunks(ctx context.Context, query, repo, kind string, sinceDays, limit int) ([]ChunkHit, error) {
 	if limit <= 0 {
 		limit = 12
 	}
@@ -312,6 +347,14 @@ func (d *DB) SearchChunks(ctx context.Context, query, repo, kind string, limit i
 	if kind != "" {
 		sqlText += ` AND kind = ?`
 		args = append(args, kind)
+	}
+	// The packet reports sinceDays, so retrieval has to honor it. Reporting a
+	// window that is not applied is worse than having no window: the agent is told
+	// the evidence is recent when it may be a year old, and provenance it cannot
+	// trust is provenance it will start ignoring.
+	if sinceDays > 0 {
+		sqlText += ` AND occurred_at >= ?`
+		args = append(args, cutoff(sinceDays))
 	}
 	sqlText += ` ORDER BY score LIMIT ?`
 	args = append(args, limit)
@@ -335,6 +378,61 @@ func (d *DB) SearchChunks(ctx context.Context, query, repo, kind string, limit i
 		out = append(out, h)
 	}
 	return out, rows.Err()
+}
+
+// RecentChunks returns the most recent passages regardless of query.
+//
+// This is what a recency fallback actually serves. A packet labelled
+// recency_fallback that carries nothing is a lie in the packet's own vocabulary:
+// the field states that recent evidence was substituted for a failed match, so
+// there had better be evidence.
+func (d *DB) RecentChunks(ctx context.Context, repo string, sinceDays, limit int) ([]ChunkHit, error) {
+	if limit <= 0 {
+		limit = 8
+	}
+	sqlText := `
+		SELECT event_seq, chunk_index, line_start, line_end, kind, source, scope, occurred_at, body
+		FROM chunks_fts WHERE 1=1`
+	var args []any
+	if repo != "" {
+		sqlText += ` AND scope = ?`
+		args = append(args, repo)
+	}
+	if sinceDays > 0 {
+		sqlText += ` AND occurred_at >= ?`
+		args = append(args, cutoff(sinceDays))
+	}
+	// chunk_index 0 opens a session — the user's ask and the first move — which is
+	// the most useful single window when there is nothing better to go on.
+	sqlText += ` AND chunk_index = 0 ORDER BY occurred_at DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := d.sql.QueryContext(ctx, sqlText, args...)
+	if err != nil {
+		return nil, fmt.Errorf("recent chunks: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ChunkHit
+	for rows.Next() {
+		var h ChunkHit
+		var scope, occurred sql.NullString
+		if err := rows.Scan(&h.EventSeq, &h.ChunkIndex, &h.LineStart, &h.LineEnd, &h.Kind,
+			&h.Source, &scope, &occurred, &h.Body); err != nil {
+			return nil, err
+		}
+		h.Scope, h.OccurredAt = scope.String, occurred.String
+		h.Excerpt = firstChars(h.Body, 280)
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// cutoff renders the RFC3339 lower bound for a day window. Timestamps are stored
+// as RFC3339 UTC strings, which sort lexicographically in the same order they sort
+// chronologically — so a string comparison is a correct time comparison.
+func cutoff(sinceDays int) string {
+	return time.Now().UTC().AddDate(0, 0, -sinceDays).Format(time.RFC3339)
 }
 
 // ExpandWindow pulls the chunks immediately before and after each hit.

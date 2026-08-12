@@ -183,6 +183,10 @@ func toolDefinitions() []map[string]any {
 						"type": "string", "enum": []string{"transcript", "error"},
 						"description": `Filter to a passage kind; "error" finds only things that failed`,
 					},
+					"sinceDays": map[string]any{
+						"type": "integer", "minimum": 1, "maximum": 365,
+						"description": "Only search sessions from the last N days (default: all history)",
+					},
 					"limit": map[string]any{
 						"type": "integer", "minimum": 1, "maximum": 50,
 						"description": "Max results (default 10)",
@@ -250,10 +254,11 @@ func (s *Server) contextForTask(ctx context.Context, raw json.RawMessage) (any, 
 
 func (s *Server) searchEvidence(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
 	var args struct {
-		Query string `json:"query"`
-		Repo  string `json:"repo"`
-		Kind  string `json:"kind"`
-		Limit int    `json:"limit"`
+		Query     string `json:"query"`
+		Repo      string `json:"repo"`
+		Kind      string `json:"kind"`
+		SinceDays int    `json:"sinceDays"`
+		Limit     int    `json:"limit"`
 	}
 	if err := json.Unmarshal(raw, &args); err != nil {
 		return nil, &rpcError{Code: -32602, Message: "invalid arguments: " + err.Error()}
@@ -265,7 +270,7 @@ func (s *Server) searchEvidence(ctx context.Context, raw json.RawMessage) (any, 
 		args.Limit = 10
 	}
 
-	hits, err := s.DB.SearchChunks(ctx, args.Query, args.Repo, args.Kind, args.Limit)
+	hits, err := s.DB.SearchChunks(ctx, args.Query, args.Repo, args.Kind, args.SinceDays, args.Limit)
 	if err != nil {
 		s.logf("search_evidence: %v", err)
 		return textResult(`{"error":"search failed"}`), nil

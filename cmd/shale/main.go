@@ -169,6 +169,10 @@ func cmdWatch(ctx context.Context, args []string) error {
 		verb = "would capture"
 	}
 	fmt.Printf("scanned %d, %s %d\n", res.Scanned, verb, res.Captured)
+	if res.Backfilled > 0 {
+		fmt.Printf("backfilled chunk index for %d already-captured session%s\n",
+			res.Backfilled, plural(res.Backfilled))
+	}
 
 	if redactions := sc.Total(); redactions > 0 {
 		fmt.Printf("redacted %d secret%s: %s\n", redactions, plural(redactions), formatCounts(sc.Counts()))

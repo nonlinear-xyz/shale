@@ -21,7 +21,7 @@ func seed(t *testing.T, db *DB, hash, title, digest, repo string) {
 	_, ok, err := db.PutSession(context.Background(), hash, SessionRecord{
 		Source: "claude_code", SourceKey: hash, Title: title, Digest: digest,
 		Repo: repo, EndedAt: time.Now().UTC(),
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("put %s: %v", hash, err)
 	}
@@ -102,7 +102,7 @@ func TestPutSessionIsIdempotentOnContentHash(t *testing.T) {
 
 	_, ok, err := db.PutSession(ctx, "aaa", SessionRecord{
 		Source: "claude_code", SourceKey: "aaa", Title: "one", Digest: "body", EndedAt: time.Now(),
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("second put: %v", err)
 	}

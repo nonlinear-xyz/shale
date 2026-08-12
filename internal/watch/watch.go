@@ -54,8 +54,10 @@ type Options struct {
 type Result struct {
 	Scanned  int
 	Captured int
-	Skipped  []Skip
-	Errors   []error
+	// Backfilled counts sessions already stored whose chunk index was repaired.
+	Backfilled int
+	Skipped    []Skip
+	Errors     []error
 }
 
 // Skip is one file the sweep declined, with why.
@@ -136,9 +138,12 @@ func Sweep(ctx context.Context, db *store.DB, sc *scrub.Scrubber, opts Options) 
 				}
 				continue
 			}
-			if outcome == outcomeCaptured {
+			switch outcome {
+			case outcomeCaptured:
 				res.Captured++
-			} else {
+			case outcomeBackfilled:
+				res.Backfilled++
+			default:
 				res.Skipped = append(res.Skipped, Skip{path, outcome.reason()})
 			}
 			if mtimeMS > maxSeen {
@@ -188,6 +193,9 @@ const (
 	outcomeCaptured outcome = iota
 	outcomeNoUserMessages
 	outcomeDuplicate
+	// outcomeBackfilled marks a session that was already stored but had no chunks —
+	// the upgrade case, repaired in place.
+	outcomeBackfilled
 )
 
 func (o outcome) reason() string {
@@ -196,6 +204,8 @@ func (o outcome) reason() string {
 		return "nothing to index (no user messages)"
 	case outcomeDuplicate:
 		return "unchanged (already captured)"
+	case outcomeBackfilled:
+		return "backfilled chunk index"
 	default:
 		return "captured"
 	}
@@ -250,52 +260,59 @@ func captureOne(ctx context.Context, db *store.DB, sc *scrub.Scrubber, path stri
 		SizeBytes:  len(joined),
 	}
 
+	chunks := chunkRows(src, scrubbed)
+
 	if opts.DryRun {
 		// Report what WOULD be captured without touching the store, so a cautious
 		// first run can be inspected before anything is written. The duplicate check
-		// still runs, so a dry run after a real one reports honestly instead of
-		// claiming it would re-capture everything.
+		// still runs, so a dry run after a real one reports honestly.
 		if seen, err := db.HasContent(ctx, contentHash); err == nil && seen {
 			return outcomeDuplicate, nil
 		}
 		return outcomeCaptured, nil
 	}
 
-	seq, inserted, err := db.PutSession(ctx, contentHash, rec)
-	if err != nil {
-		return outcomeCaptured, err
-	}
-	if !inserted {
-		return outcomeDuplicate, nil
-	}
-
-	// Index the transcript body, not just the digest. The digest is what was asked
-	// and what broke — roughly 4% of what was captured. Everything the agent
-	// actually did lives in the chunks, and without them it is stored but
-	// unsearchable.
-	//
-	// Chunks are built from the SCRUBBED lines so line numbers point at the blob on
-	// disk, which is what makes a citation checkable.
-	if chunks := chunkRows(src, scrubbed); len(chunks) > 0 {
-		scope := rec.Repo
-		if scope == "" {
-			scope = rec.CWD
-		}
-		occurred := rec.EndedAt
-		if occurred.IsZero() {
-			occurred = time.Now().UTC()
-		}
-		if err := db.PutChunks(ctx, seq, string(src), scope, occurred.UTC().Format(time.RFC3339), chunks); err != nil {
-			return outcomeCaptured, fmt.Errorf("index chunks: %w", err)
-		}
-	}
-	// The blob is written AFTER the event commits. If this fails the event points
-	// at a missing blob, which `shale status` can detect and re-capture repairs —
-	// whereas an orphaned blob with no event would never be noticed at all.
+	// The blob is written BEFORE the event. Blobs are content-addressed, so an
+	// orphaned one is harmless and costs only disk; an event pointing at a missing
+	// blob is a dangling reference the corpus cannot repair itself out of. Order
+	// the two so the failure mode is the recoverable one.
 	if err := writeBlob(db.BlobPath(contentHash), joined); err != nil {
 		return outcomeCaptured, fmt.Errorf("write blob: %w", err)
 	}
-	return outcomeCaptured, nil
+
+	seq, inserted, err := db.PutSession(ctx, contentHash, rec, chunks)
+	if err != nil {
+		return outcomeCaptured, err
+	}
+	if inserted {
+		return outcomeCaptured, nil
+	}
+
+	// Already stored. Repair rather than skip: a session captured by a build that
+	// predates chunking has an event and no chunks, and nothing else will ever
+	// offer this file again because dedupe is keyed on content hash. Without this,
+	// upgrading leaves the entire existing corpus invisible to the search it was
+	// installed for.
+	n, err := db.ChunkCount(ctx, seq)
+	if err != nil {
+		return outcomeDuplicate, fmt.Errorf("chunk count: %w", err)
+	}
+	if n > 0 || len(chunks) == 0 {
+		return outcomeDuplicate, nil
+	}
+
+	scope := rec.Repo
+	if scope == "" {
+		scope = rec.CWD
+	}
+	occurred := rec.EndedAt
+	if occurred.IsZero() {
+		occurred = time.Now().UTC()
+	}
+	if err := db.PutChunks(ctx, seq, string(src), scope, occurred.UTC().Format(time.RFC3339), chunks); err != nil {
+		return outcomeDuplicate, fmt.Errorf("backfill chunks: %w", err)
+	}
+	return outcomeBackfilled, nil
 }
 
 // chunkRows extracts readable text from a transcript and groups it into

@@ -154,22 +154,24 @@ func Build(ctx context.Context, db *store.DB, in Input) (*Packet, error) {
 	p.Sections.Corrections = []Evidence{}
 	p.Sections.Evidence = []Evidence{}
 
+	fill := int(float64(budget) * fillRatio)
+	served := map[string]bool{}
+
 	terms := DistillQuery(in.Task, 8)
 	if len(terms) == 0 {
-		p.Retrieval = "recency_fallback"
-		return p, nil
+		return fallback(ctx, db, p, in, since, fill, served)
 	}
 
 	// The retrieval ladder. Start strict, loosen only when strict comes up short,
 	// and say which rung was used.
 	andQuery := strings.Join(terms, " AND ")
-	hits, err := db.SearchChunks(ctx, andQuery, in.Repo, "", 24)
+	hits, err := db.SearchChunks(ctx, andQuery, in.Repo, "", since, 24)
 	if err != nil {
 		return nil, err
 	}
 	if len(hits) < 3 {
 		orQuery := strings.Join(terms, " OR ")
-		loose, err := db.SearchChunks(ctx, orQuery, in.Repo, "", 24)
+		loose, err := db.SearchChunks(ctx, orQuery, in.Repo, "", since, 24)
 		if err != nil {
 			return nil, err
 		}
@@ -180,14 +182,13 @@ func Build(ctx context.Context, db *store.DB, in Input) (*Packet, error) {
 		}
 	}
 
-	corrections, err := db.SearchChunks(ctx, strings.Join(terms, " OR "), in.Repo, "error", 8)
+	corrections, err := db.SearchChunks(ctx, strings.Join(terms, " OR "), in.Repo, "error", since, 8)
 	if err != nil {
 		return nil, err
 	}
 
 	if len(hits) == 0 && len(corrections) == 0 {
-		p.Retrieval = "recency_fallback"
-		return p, nil
+		return fallback(ctx, db, p, in, since, fill, served)
 	}
 
 	// Window expansion: pull the chunks either side of each hit so evidence reads
@@ -197,9 +198,6 @@ func Build(ctx context.Context, db *store.DB, in Input) (*Packet, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	fill := int(float64(budget) * fillRatio)
-	served := map[string]bool{}
 
 	// Corrections are filled first so an error is never crowded out by ordinary
 	// evidence that merely scored higher.
@@ -297,6 +295,36 @@ func sumTokens(es []Evidence) int {
 		n += EstimateTokens(e.Content) + EstimateTokens(e.Title) + 16
 	}
 	return n
+}
+
+// fallback fills a packet with the most recent work when the query matched
+// nothing.
+//
+// It exists because a packet labelled recency_fallback that carries no evidence
+// is a lie in the packet's own vocabulary — the field states that recent evidence
+// was substituted for a failed match. An agent reading an empty packet learns
+// nothing and has no way to tell "nothing matched" from "nothing is captured".
+func fallback(ctx context.Context, db *store.DB, p *Packet, in Input, since, fill int, served map[string]bool) (*Packet, error) {
+	p.Retrieval = "recency_fallback"
+
+	recent, err := db.RecentChunks(ctx, in.Repo, since, 8)
+	if err != nil {
+		return nil, err
+	}
+	p.Sections.Evidence, p.Budget.Truncated = fillSection(
+		"evidence", recent, fill, timeNow(in), served, p.Budget.Truncated)
+	for _, e := range p.Sections.Evidence {
+		p.Citations = append(p.Citations, e.Ref)
+	}
+	p.Budget.UsedTokens = sumTokens(p.Sections.Evidence)
+	return p, nil
+}
+
+func timeNow(in Input) time.Time {
+	if in.Now.IsZero() {
+		return time.Now()
+	}
+	return in.Now
 }
 
 func clamp(v, lo, hi, def int) int {
