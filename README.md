@@ -10,6 +10,7 @@ local append-only store, and serves them back to any agent over MCP.
 shale repos              # what shale can see on this machine (no network, ever)
 shale watch              # capture settled sessions into the local store
 shale search <query>     # search your own corpus
+shale show <ref>         # read the passage or session a result cites
 shale status             # what has been captured
 shale mcp                # serve context to agents over stdio MCP   (in progress)
 shale link               # replicate to a hub for cross-machine joins (in progress)
@@ -66,12 +67,31 @@ MCP server with a one-sentence description of what you're about to do.
 Treat `recency_fallback` packets with low confidence.
 ```
 
-## Search
+## Search, then read
 
 Search is lexical (FTS5, porter stemming, bm25). Exact identifiers, file names
 and error messages work best; `AND`/`OR`/`NOT` and `"quoted phrases"` work as
 you'd expect, and everything else is treated as a literal term — so `kai-214`
 and `C++` search for what you typed rather than erroring.
+
+Every result carries a **ref**, and `shale show` takes it — so finding a passage
+and reading around it are one motion:
+
+```sh
+$ shale search MACOS_SIGN_P12
+  demo: why did the goreleaser signing step fail on the darwin build?
+    claude_code · /tmp/demo · 2026-08-12 · lines 1–5 · error
+    … tool_error: signing failed: MACOS_SIGN_P12 not set …
+    shale show chunk:1:0
+
+$ shale show chunk:1:0          # the passage, plus a chunk of context either side
+$ shale show chunk:1:0 --full   # the whole session
+$ shale show session:1 --lines 40,90
+```
+
+`--kind error`, `--repo owner/name` and `--since <days>` narrow a search the same
+way the MCP tools do; the CLI and the MCP server read the same chunk index, so
+they cannot give you different answers to the same question.
 
 ## What leaves your machine
 

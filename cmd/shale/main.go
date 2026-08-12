@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -39,6 +40,7 @@ Usage:
   shale repos               list git repositories found on this machine (local only)
   shale watch               capture settled agent sessions into the local store
   shale search <query>      search the local corpus
+  shale show <ref>          print the passage or session a ref names
   shale status              what has been captured
   shale mcp                 serve context to agents over stdio MCP
   shale version             print the build version
@@ -71,6 +73,8 @@ func main() {
 		err = cmdWatch(ctx, args)
 	case "search":
 		err = cmdSearch(ctx, args)
+	case "show":
+		err = cmdShow(ctx, args)
 	case "status":
 		err = cmdStatus(ctx, args)
 	case "mcp":
@@ -198,13 +202,26 @@ func cmdWatch(ctx context.Context, args []string) error {
 }
 
 // cmdSearch queries the local corpus. Lexical, local, no model involved.
+//
+// This searches CHUNKS — the transcript bodies — not the per-session digests.
+// The distinction is the whole point. There is one digest per session and dozens
+// of chunks, so the digest index sees a few percent of what was captured; a
+// phrase that is plainly in a transcript is simply absent from it. Searching
+// digests here meant the CLI and the MCP server disagreed about what "the
+// corpus" contains, and the CLI's answer was a confident, silent "no matches"
+// for text shale was holding the whole time. Both surfaces read the same index
+// now.
 func cmdSearch(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("search", flag.ExitOnError)
 	limit := fs.Int("limit", 10, "maximum results")
+	repo := fs.String("repo", "", `filter to one repository ("owner/name")`)
+	kind := fs.String("kind", "", `filter to a passage kind ("error" finds only things that failed)`)
+	sinceDays := fs.Int("since", 0, "only search sessions from the last N days")
 	// Go's flag package stops parsing at the first positional argument, so
 	// `search worktree --limit 3` would put "--limit 3" INTO the query and search
 	// for it. Nobody types flags before a search term, so reorder first.
-	if err := fs.Parse(reorderFlagsFirst(args, map[string]bool{"limit": true})); err != nil {
+	valued := map[string]bool{"limit": true, "repo": true, "kind": true, "since": true}
+	if err := fs.Parse(reorderFlagsFirst(args, valued)); err != nil {
 		return err
 	}
 	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
@@ -218,7 +235,7 @@ func cmdSearch(ctx context.Context, args []string) error {
 	}
 	defer db.Close()
 
-	hits, err := db.Search(ctx, query, *limit)
+	hits, err := db.SearchChunks(ctx, query, *repo, *kind, *sinceDays, *limit)
 	if err != nil {
 		return err
 	}
@@ -227,20 +244,122 @@ func cmdSearch(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	fmt.Printf("\n%s for %q.\n\n", render.CountPhrase(len(hits), "match", "matches"), query)
+	// One lookup for every session the hits landed in, so each result can be
+	// shown under the session it came from rather than as a floating excerpt.
+	seqs := make([]int64, 0, len(hits))
 	for _, h := range hits {
-		scope := h.Scope
-		if scope == "" {
-			scope = "—"
-		}
-		fmt.Printf("  %s\n", h.Title)
-		fmt.Printf("    %s · %s · %s\n", h.Source, scope, h.OccurredAt)
-		if h.Excerpt != "" {
-			fmt.Printf("    %s\n", strings.ReplaceAll(strings.TrimSpace(h.Excerpt), "\n", " "))
-		}
-		fmt.Println()
+		seqs = append(seqs, h.EventSeq)
 	}
+	sessions, err := db.Sessions(ctx, seqs)
+	if err != nil {
+		return err
+	}
+
+	render.SearchResults(os.Stdout, query, hits, sessions)
 	return nil
+}
+
+// cmdShow resolves a ref to the passage or session it names.
+//
+// Refs were mintable and not resolvable: packets and search results cited
+// "chunk:12:3" and nothing in the binary could turn that back into text, so
+// following a citation meant querying SQLite by hand and gunzipping a blob.
+// A citation you cannot follow is decoration.
+func cmdShow(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("show", flag.ExitOnError)
+	full := fs.Bool("full", false, "print the entire session transcript")
+	lines := fs.String("lines", "", "print an explicit line range, e.g. 120,180")
+	context_ := fs.Int("context", 1, "chunks of surrounding context to include either side")
+	valued := map[string]bool{"lines": true, "context": true}
+	if err := fs.Parse(reorderFlagsFirst(args, valued)); err != nil {
+		return err
+	}
+	arg := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if arg == "" {
+		return errors.New(`usage: shale show <ref>   (chunk:<seq>:<index>, session:<seq> or <seq>)`)
+	}
+	ref, err := store.ParseRef(arg)
+	if err != nil {
+		return err
+	}
+
+	db, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	info, err := db.Session(ctx, ref.EventSeq)
+	if err != nil {
+		return err
+	}
+
+	lineStart, lineEnd, err := showRange(ctx, db, ref, *full, *lines, *context_)
+	if err != nil {
+		return err
+	}
+
+	blob, err := db.ReadBlob(info.ContentHash)
+	if err != nil {
+		return fmt.Errorf("%w\n\nThe event is in the log but its transcript is not on disk. "+
+			"Blobs are content-addressed under ~/.shale/blobs", err)
+	}
+
+	segs := sessions.Segments(sessions.Source(info.Source), blob)
+	render.Transcript(os.Stdout, info, segs, lineStart, lineEnd, len(blob))
+	return nil
+}
+
+// showRange decides which lines of the transcript to print.
+//
+// Precedence is explicit over implied: --lines beats --full beats the chunk the
+// ref names. A whole-session ref with no flags shows everything, because "show
+// me session 12" has no narrower reading.
+func showRange(ctx context.Context, db *store.DB, ref store.Ref, full bool, lines string, ctxChunks int) (int, int, error) {
+	if lines != "" {
+		return parseLineRange(lines)
+	}
+	if full || !ref.HasChunk {
+		return 0, 0, nil // 0,0 means unbounded
+	}
+
+	hit, err := db.Chunk(ctx, ref.EventSeq, ref.ChunkIndex)
+	if err != nil {
+		return 0, 0, err
+	}
+	start, end := hit.LineStart, hit.LineEnd
+
+	// Widen through the neighbouring chunks rather than by a fixed line count.
+	// Chunk boundaries fall between turns, so this keeps whole exchanges intact
+	// instead of slicing one in half at an arbitrary offset.
+	for i := 1; i <= ctxChunks; i++ {
+		if before, err := db.Chunk(ctx, ref.EventSeq, ref.ChunkIndex-i); err == nil && before.LineStart < start {
+			start = before.LineStart
+		}
+		if after, err := db.Chunk(ctx, ref.EventSeq, ref.ChunkIndex+i); err == nil && after.LineEnd > end {
+			end = after.LineEnd
+		}
+	}
+	return start, end, nil
+}
+
+func parseLineRange(s string) (int, int, error) {
+	parts := strings.Split(s, ",")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("bad --lines %q: want start,end", s)
+	}
+	start, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad --lines %q: %v", s, err)
+	}
+	end, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad --lines %q: %v", s, err)
+	}
+	if start > end {
+		return 0, 0, fmt.Errorf("bad --lines %q: start is after end", s)
+	}
+	return start, end, nil
 }
 
 // cmdMCP serves the local corpus to an agent over stdio.

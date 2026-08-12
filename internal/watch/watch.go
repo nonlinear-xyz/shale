@@ -334,11 +334,16 @@ func chunkRows(src sessions.Source, scrubbed []string) []store.ChunkRow {
 
 // writeBlob stores the scrubbed transcript gzipped and content-addressed, written
 // atomically so a crash cannot leave a truncated blob that an event points at.
+//
+// path arrives complete from store.BlobPath, gzip suffix included. This function
+// does not decorate it: the name the event records and the name the bytes land
+// under have to be the same string, and the way to guarantee that is to have
+// only one place that builds it.
 func writeBlob(path, body string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	if _, err := os.Stat(path + ".gz"); err == nil {
+	if _, err := os.Stat(path); err == nil {
 		return nil // content-addressed: identical bytes, already stored
 	}
 	tmp := path + ".tmp"
@@ -362,7 +367,7 @@ func writeBlob(path, body string) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path+".gz")
+	return os.Rename(tmp, path)
 }
 
 // repoFor resolves a working directory to its normalized owner/name. Reuses the

@@ -11,12 +11,16 @@
 package store
 
 import (
+	"bufio"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -62,12 +66,22 @@ func (d *DB) Close() error { return d.sql.Close() }
 // BlobPath is where a scrubbed transcript with this content hash lives.
 // Content-addressing means a re-captured session that hasn't changed costs
 // nothing, and a grown session shares every unchanged byte with its earlier form.
+//
+// The ".gz" is part of the path this function returns, not something the writer
+// bolts on afterwards. It used to be: BlobPath named a .jsonl that the writer
+// then renamed to .jsonl.gz, so every pointer recorded in events named a file
+// that has never existed on disk. One function owns the name now, and both the
+// writer and the reader ask it — which is the only arrangement in which they
+// cannot drift apart again.
 func (d *DB) BlobPath(contentHash string) string {
 	if len(contentHash) < 2 {
-		return filepath.Join(d.root, "blobs", contentHash+".jsonl")
+		return filepath.Join(d.root, "blobs", contentHash+blobExt)
 	}
-	return filepath.Join(d.root, "blobs", contentHash[:2], contentHash+".jsonl")
+	return filepath.Join(d.root, "blobs", contentHash[:2], contentHash+blobExt)
 }
+
+// blobExt is the on-disk suffix for a stored transcript: JSONL, gzipped.
+const blobExt = ".jsonl.gz"
 
 const schema = `
 CREATE TABLE IF NOT EXISTS events (
@@ -319,6 +333,223 @@ type ChunkHit struct {
 func (h ChunkHit) Ref() string {
 	return fmt.Sprintf("chunk:%d:%d", h.EventSeq, h.ChunkIndex)
 }
+
+// Ref addresses a passage, or a whole session when ChunkIndex is absent.
+//
+// A citation format with no parser is decoration. Every ref this binary hands
+// out — in a packet, in a search result — has to come back in and resolve to the
+// bytes it names, or the provenance it advertises is unverifiable in practice.
+type Ref struct {
+	EventSeq   int64
+	ChunkIndex int
+	HasChunk   bool // false for a whole-session ref
+}
+
+func (r Ref) String() string {
+	if r.HasChunk {
+		return fmt.Sprintf("chunk:%d:%d", r.EventSeq, r.ChunkIndex)
+	}
+	return fmt.Sprintf("session:%d", r.EventSeq)
+}
+
+// ParseRef accepts the forms a person or an agent actually has in hand:
+//
+//	chunk:12:3    a packet citation, pasted back verbatim
+//	session:12    a whole session
+//	12            the same, for someone typing rather than pasting
+func ParseRef(s string) (Ref, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return Ref{}, errors.New("empty ref")
+	}
+
+	switch parts := strings.Split(s, ":"); {
+	case len(parts) == 1:
+		seq, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil {
+			return Ref{}, fmt.Errorf("not a ref: %q (want chunk:<seq>:<index>, session:<seq> or <seq>)", s)
+		}
+		return Ref{EventSeq: seq}, nil
+
+	case parts[0] == "session" && len(parts) == 2:
+		seq, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return Ref{}, fmt.Errorf("bad session ref %q: %v", s, err)
+		}
+		return Ref{EventSeq: seq}, nil
+
+	case parts[0] == "chunk" && len(parts) == 3:
+		seq, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return Ref{}, fmt.Errorf("bad chunk ref %q: %v", s, err)
+		}
+		idx, err := strconv.Atoi(parts[2])
+		if err != nil {
+			return Ref{}, fmt.Errorf("bad chunk ref %q: %v", s, err)
+		}
+		return Ref{EventSeq: seq, ChunkIndex: idx, HasChunk: true}, nil
+
+	default:
+		return Ref{}, fmt.Errorf("not a ref: %q (want chunk:<seq>:<index>, session:<seq> or <seq>)", s)
+	}
+}
+
+// SessionInfo is what the log knows about one captured session, addressed by the
+// event seq that every ref carries.
+type SessionInfo struct {
+	Seq         int64
+	Source      string
+	Scope       string
+	OccurredAt  string
+	ContentHash string
+	Record      SessionRecord
+}
+
+// Session loads one session by event seq.
+//
+// The blob is located from ContentHash via BlobPath, never from the event's
+// stored pointer. Events are append-only by DDL trigger, so pointers written by
+// builds that named the blob wrongly cannot be corrected in place — but the
+// content hash was always right, and content-addressing means the hash is the
+// real address. The pointer column is a record of what the writer believed at
+// the time; the hash is how you find the bytes.
+func (d *DB) Session(ctx context.Context, seq int64) (SessionInfo, error) {
+	var s SessionInfo
+	var scope, hash sql.NullString
+	var payload string
+	err := d.sql.QueryRowContext(ctx, `
+		SELECT seq, source, scope, occurred_at, content_hash, payload
+		FROM events WHERE seq = ? AND kind = ?`, seq, KindSessionCaptured).
+		Scan(&s.Seq, &s.Source, &scope, &s.OccurredAt, &hash, &payload)
+	if err == sql.ErrNoRows {
+		return s, fmt.Errorf("no session with seq %d", seq)
+	}
+	if err != nil {
+		return s, fmt.Errorf("load session: %w", err)
+	}
+	s.Scope, s.ContentHash = scope.String, hash.String
+	if err := json.Unmarshal([]byte(payload), &s.Record); err != nil {
+		return s, fmt.Errorf("decode session %d: %w", seq, err)
+	}
+	return s, nil
+}
+
+// PointerFor returns the blob path the log recorded for an event.
+//
+// This is the writer's claim about where the bytes went, not the address the
+// reader uses — that is BlobPath(ContentHash). The two must agree, and there is
+// a test that says so. Exposed for that test and for diagnostics; resolving a
+// ref should go through ContentHash, which cannot go stale.
+func (d *DB) PointerFor(ctx context.Context, seq int64) (string, error) {
+	var pointer sql.NullString
+	err := d.sql.QueryRowContext(ctx, `SELECT pointer FROM events WHERE seq = ?`, seq).Scan(&pointer)
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("no event with seq %d", seq)
+	}
+	return pointer.String, err
+}
+
+// Sessions loads several sessions at once, keyed by seq. Missing seqs are simply
+// absent from the map — a search result whose event vanished should degrade to a
+// missing title, not to a failed search.
+func (d *DB) Sessions(ctx context.Context, seqs []int64) (map[int64]SessionInfo, error) {
+	out := make(map[int64]SessionInfo, len(seqs))
+	if len(seqs) == 0 {
+		return out, nil
+	}
+
+	seen := make(map[int64]bool, len(seqs))
+	placeholders := make([]string, 0, len(seqs))
+	args := make([]any, 0, len(seqs)+1)
+	args = append(args, KindSessionCaptured)
+	for _, seq := range seqs {
+		if seen[seq] {
+			continue
+		}
+		seen[seq] = true
+		placeholders = append(placeholders, "?")
+		args = append(args, seq)
+	}
+
+	rows, err := d.sql.QueryContext(ctx, `
+		SELECT seq, source, scope, occurred_at, content_hash, payload
+		FROM events WHERE kind = ? AND seq IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("load sessions: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var s SessionInfo
+		var scope, hash sql.NullString
+		var payload string
+		if err := rows.Scan(&s.Seq, &s.Source, &scope, &s.OccurredAt, &hash, &payload); err != nil {
+			return nil, err
+		}
+		s.Scope, s.ContentHash = scope.String, hash.String
+		// A session whose payload will not decode still has usable identity, so
+		// keep it rather than failing the whole lookup.
+		_ = json.Unmarshal([]byte(payload), &s.Record)
+		out[s.Seq] = s
+	}
+	return out, rows.Err()
+}
+
+// Chunk loads one indexed passage by ref.
+func (d *DB) Chunk(ctx context.Context, eventSeq int64, chunkIndex int) (ChunkHit, error) {
+	var h ChunkHit
+	var scope, occurred sql.NullString
+	err := d.sql.QueryRowContext(ctx, `
+		SELECT event_seq, chunk_index, line_start, line_end, kind, source, scope, occurred_at, body
+		FROM chunks_fts WHERE event_seq = ? AND chunk_index = ?`, eventSeq, chunkIndex).
+		Scan(&h.EventSeq, &h.ChunkIndex, &h.LineStart, &h.LineEnd, &h.Kind,
+			&h.Source, &scope, &occurred, &h.Body)
+	if err == sql.ErrNoRows {
+		return h, fmt.Errorf("no chunk %d:%d", eventSeq, chunkIndex)
+	}
+	if err != nil {
+		return h, fmt.Errorf("load chunk: %w", err)
+	}
+	h.Scope, h.OccurredAt = scope.String, occurred.String
+	return h, nil
+}
+
+// ReadBlob returns the scrubbed transcript for a content hash, decompressed and
+// split into lines. Line N of the result is line N+1 by the 1-based numbering
+// that chunks and segments use, so a LineStart/LineEnd pair indexes it directly.
+func (d *DB) ReadBlob(contentHash string) ([]string, error) {
+	path := d.BlobPath(contentHash)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open blob: %w", err)
+	}
+	defer f.Close()
+
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("read blob %s: %w", path, err)
+	}
+	defer zr.Close()
+
+	// Transcript lines routinely exceed bufio.Scanner's default 64KB limit — a
+	// single tool result carrying a file's contents is one line. Scanning with the
+	// default silently truncates the session at the first big line.
+	sc := bufio.NewScanner(zr)
+	sc.Buffer(make([]byte, 0, 1<<20), maxBlobLine)
+
+	var lines []string
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("read blob %s: %w", path, err)
+	}
+	return lines, nil
+}
+
+// maxBlobLine caps a single transcript record. Tool outputs are the long ones;
+// 16MB is far past anything observed and still bounded.
+const maxBlobLine = 16 << 20
 
 // SearchChunks runs FTS over transcript bodies.
 //
