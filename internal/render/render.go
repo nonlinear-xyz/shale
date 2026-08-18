@@ -151,6 +151,97 @@ func SearchResults(w io.Writer, t *ui.Theme, query string, hits []store.ChunkHit
 	}
 }
 
+// ArtifactSearchResults prints durable-state matches with their exact versioned
+// refs so a result can be resolved even after the artifact changes.
+func ArtifactSearchResults(w io.Writer, t *ui.Theme, query string, hits []store.ArtifactHit) {
+	fmt.Fprintf(w, "\n%s for %q.\n\n", t.Count.Render(CountPhrase(len(hits), "match", "matches")), query)
+	terms := queryTerms(query)
+	for _, h := range hits {
+		facts := []string{string(h.Kind), string(h.Status), artifactScope(h.Artifact), h.Source, shortStamp(h.UpdatedAt)}
+		fmt.Fprintf(w, "  %s\n", t.Title.Render(oneLine(h.Title, 120)))
+		fmt.Fprintf(w, "    %s\n", t.Facts.Render(strings.Join(facts, " · ")))
+		if h.Excerpt != "" {
+			fmt.Fprintf(w, "    %s\n", highlight(t, oneLine(h.Excerpt, 220), terms))
+		}
+		fmt.Fprintf(w, "    %s\n\n", t.Ref.Render("shale show "+h.VersionedRef()))
+	}
+}
+
+// ArtifactList prints current durable artifacts. Lifecycle commands operate on
+// the stable ref; the exact version remains visible for citations and audits.
+func ArtifactList(w io.Writer, t *ui.Theme, noun string, items []store.Artifact) {
+	if len(items) == 0 {
+		fmt.Fprintf(w, "No %s.\n", noun)
+		return
+	}
+	fmt.Fprintf(w, "\n%s.\n\n", t.Count.Render(CountPhrase(len(items), artifactSingular(noun), noun)))
+	for _, a := range items {
+		facts := []string{string(a.Status), artifactScope(a), a.Source, shortStamp(a.UpdatedAt)}
+		fmt.Fprintf(w, "  %s\n", t.Title.Render(oneLine(a.Title, 120)))
+		fmt.Fprintf(w, "    %s\n", t.Facts.Render(strings.Join(facts, " · ")))
+		fmt.Fprintf(w, "    %s", t.Ref.Render(a.Ref()))
+		if a.EventSeq > 0 {
+			fmt.Fprintf(w, " %s", t.Facts.Render(fmt.Sprintf("(version @%d)", a.EventSeq)))
+		}
+		fmt.Fprint(w, "\n\n")
+	}
+}
+
+func artifactSingular(noun string) string {
+	switch noun {
+	case "memories":
+		return "memory"
+	default:
+		return strings.TrimSuffix(noun, "s")
+	}
+}
+
+// ArtifactDetail prints one current or historical artifact version.
+func ArtifactDetail(w io.Writer, t *ui.Theme, a store.Artifact) {
+	fmt.Fprintf(w, "\n%s\n", t.Title.Render(oneLine(a.Title, 200)))
+	facts := []string{a.VersionedRef(), string(a.Status), artifactScope(a), a.Source, a.Authority, shortStamp(a.UpdatedAt)}
+	if a.Origin != "" {
+		facts = append(facts, a.Origin)
+	}
+	fmt.Fprintf(w, "%s\n", t.Facts.Render(strings.Join(facts, " · ")))
+	if a.SourcePointer != "" {
+		fmt.Fprintf(w, "%s\n", t.Facts.Render(a.SourcePointer))
+	}
+	if a.Content.Trigger != "" {
+		fmt.Fprintf(w, "%s\n", t.Facts.Render("recall when: "+a.Content.Trigger))
+	}
+	if len(a.Content.EvidenceRefs) > 0 && a.Kind != store.ArtifactCheckpoint {
+		fmt.Fprintf(w, "%s\n", t.Facts.Render("evidence: "+strings.Join(a.Content.EvidenceRefs, ", ")))
+	}
+	fmt.Fprintln(w)
+	if !a.ContentPresent {
+		fmt.Fprintln(w, t.Hint.Render("(content is unavailable or has been purged)"))
+		return
+	}
+	body := a.Content.RenderText(a.Kind)
+	if strings.TrimSpace(body) == "" {
+		fmt.Fprintln(w, t.Hint.Render("(empty content)"))
+		return
+	}
+	fmt.Fprintln(w, body)
+}
+
+func artifactScope(a store.Artifact) string {
+	switch a.ScopeKind {
+	case store.ScopeUser:
+		return "user"
+	case store.ScopeRepo:
+		return "repo:" + a.Repo
+	case store.ScopeTask:
+		if a.Repo != "" {
+			return "task:" + a.ScopeKey + " · " + a.Repo
+		}
+		return "task:" + a.ScopeKey
+	default:
+		return string(a.ScopeKind)
+	}
+}
+
 // Transcript prints a session, optionally clipped to a line range.
 //
 // lineStart/lineEnd are 1-based and inclusive; 0,0 means the whole thing.

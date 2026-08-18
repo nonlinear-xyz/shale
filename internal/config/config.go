@@ -49,13 +49,22 @@ type Machine struct {
 	Created  string `json:"created"`
 }
 
-// StateDir is ~/.shale, created on demand with owner-only permissions.
-func StateDir() (string, error) {
+// StateDirPath returns ~/.shale without creating it. Read-only previews use this
+// to uphold their promise not to touch persistent state.
+func StateDirPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("cannot determine home directory: %w", err)
 	}
-	dir := filepath.Join(home, stateDirName)
+	return filepath.Join(home, stateDirName), nil
+}
+
+// StateDir is ~/.shale, created on demand with owner-only permissions.
+func StateDir() (string, error) {
+	dir, err := StateDirPath()
+	if err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("cannot create %s: %w", dir, err)
 	}

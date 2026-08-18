@@ -224,6 +224,12 @@ func (m Model) statusPane() string {
 		{"sessions", fmt.Sprint(m.stats.Sessions)},
 		{"repositories", fmt.Sprint(m.stats.Repos)},
 		{"indexed chunks", fmt.Sprint(m.stats.Chunks)},
+		{"active memories", fmt.Sprint(m.stats.Memories)},
+		{"pending proposals", fmt.Sprint(m.stats.Proposals)},
+		{"task checkpoints", fmt.Sprint(m.stats.Checkpoints)},
+		{"active runbooks", fmt.Sprint(m.stats.Runbooks)},
+		{"indexed instructions", fmt.Sprint(m.stats.Instructions)},
+		{"watched sources", fmt.Sprint(m.stats.Sources)},
 	}
 	if m.stats.OldestAt != "" {
 		rows = append(rows, [2]string{"span", m.stats.OldestAt + " → " + m.stats.NewestAt})
@@ -235,7 +241,11 @@ func (m Model) statusPane() string {
 	}
 
 	if m.stats.Sessions == 0 {
-		b.WriteString("\n" + m.th.Warn.Render("Nothing captured yet. Run `shale watch`.") + "\n")
+		message := "No agent sessions captured yet. Run `shale watch`."
+		if m.stats.Memories+m.stats.Proposals+m.stats.Checkpoints+m.stats.Runbooks+m.stats.Instructions == 0 {
+			message = "Nothing captured yet. Run `shale watch` or `shale remember`."
+		}
+		b.WriteString("\n" + m.th.Warn.Render(message) + "\n")
 		b.WriteString(m.th.Hint.Render("Sessions must be idle for 30 minutes before they are swept.") + "\n")
 	}
 	return b.String()
