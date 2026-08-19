@@ -16,6 +16,32 @@ func newTestDB(t *testing.T) *DB {
 	return db
 }
 
+func TestOpenReadOnlyCanInspectButNotMutateStore(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetCursor(context.Background(), "codex", 42); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ro, err := OpenReadOnly(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	if got, err := ro.Cursor(context.Background(), "codex"); err != nil || got != 42 {
+		t.Fatalf("read-only cursor = %d err=%v", got, err)
+	}
+	if err := ro.SetCursor(context.Background(), "codex", 99); err == nil {
+		t.Fatal("read-only store accepted a write")
+	}
+}
+
 func seed(t *testing.T, db *DB, hash, title, digest, repo string) {
 	t.Helper()
 	_, ok, err := db.PutSession(context.Background(), hash, SessionRecord{

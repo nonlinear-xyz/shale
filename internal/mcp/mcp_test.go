@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -81,7 +82,10 @@ func TestInitializeAndToolsList(t *testing.T) {
 	for _, raw := range tools {
 		names[raw.(map[string]any)["name"].(string)] = true
 	}
-	for _, want := range []string{"context_for_task", "search_evidence"} {
+	for _, want := range []string{
+		"context_for_task", "search_evidence", "remember_explicit",
+		"propose_memory", "save_checkpoint", "read_ref",
+	} {
 		if !names[want] {
 			t.Errorf("tool %q missing from tools/list", want)
 		}
@@ -144,7 +148,7 @@ func TestEmptyCorpusReturnsAWellFormedPacket(t *testing.T) {
 	// The sections must be present and empty, never null: an agent that indexes
 	// into a null section crashes on what should be an ordinary empty result.
 	sections := p["sections"].(map[string]any)
-	for _, k := range []string{"corrections", "evidence"} {
+	for _, k := range []string{"checkpoints", "memories", "runbooks", "corrections", "evidence"} {
 		if sections[k] == nil {
 			t.Errorf("section %q is null; must be an empty array", k)
 		}
@@ -152,6 +156,108 @@ func TestEmptyCorpusReturnsAWellFormedPacket(t *testing.T) {
 	if p["citations"] == nil {
 		t.Error("citations is null; must be an empty array")
 	}
+}
+
+func TestMemoryWritesRespectApprovalBoundaryAndReadRef(t *testing.T) {
+	s := newServer(t)
+	proposed := run(t, s,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"propose_memory","arguments":{"text":"Release signing needs the purple inferred key","repo":"acme/app"}}}`,
+	)
+	proposal := toolPayload(t, proposed[0])
+	if proposal["status"] != string(store.ArtifactPending) {
+		t.Fatalf("proposal status = %v, want pending", proposal["status"])
+	}
+	if !strings.Contains(proposal["approvalCommand"].(string), "shale accept memory:") {
+		t.Errorf("proposal has no actionable approval command: %v", proposal)
+	}
+
+	direct := run(t, s,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember_explicit","arguments":{"text":"Release signing uses the green explicit key","repo":"acme/app","evidenceRefs":[]}}}`,
+	)
+	memory := toolPayload(t, direct[0])
+	if memory["status"] != string(store.ArtifactActive) {
+		t.Fatalf("direct memory status = %v, want active", memory["status"])
+	}
+
+	packetResponse := run(t, s,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"context_for_task","arguments":{"task":"release signing key","repo":"acme/app"}}}`,
+	)
+	packet := toolPayload(t, packetResponse[0])
+	memories := packet["sections"].(map[string]any)["memories"].([]any)
+	if len(memories) != 1 {
+		t.Fatalf("packet memories = %d, want only the active memory", len(memories))
+	}
+	content := memories[0].(map[string]any)["content"].(string)
+	if !strings.Contains(content, "green explicit") || strings.Contains(content, "purple inferred") {
+		t.Errorf("approval boundary failed; served content %q", content)
+	}
+
+	ref := memory["versionedRef"].(string)
+	read := run(t, s, fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_ref","arguments":{"ref":%q}}}`,
+		ref,
+	))
+	resolved := toolPayload(t, read[0])
+	if resolved["versionedRef"] != ref || resolved["contentPresent"] != true {
+		t.Errorf("read_ref did not resolve exact memory version: %v", resolved)
+	}
+}
+
+func TestCheckpointsChainAndLatestTaskCheckpointIsServed(t *testing.T) {
+	s := newServer(t)
+	first := run(t, s,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"save_checkpoint","arguments":{"taskKey":"REL-42","repo":"acme/app","goal":"Ship release","summary":"Signing is done"}}}`,
+	)
+	firstPayload := toolPayload(t, first[0])
+	second := run(t, s,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"save_checkpoint","arguments":{"taskKey":"REL-42","repo":"acme/app","goal":"Ship release","summary":"Notarization is done","nextActions":["Publish"]}}}`,
+	)
+	secondPayload := toolPayload(t, second[0])
+	if secondPayload["previousCheckpoint"] != firstPayload["versionedRef"] {
+		t.Errorf("checkpoint chain = %v, want %v", secondPayload["previousCheckpoint"], firstPayload["versionedRef"])
+	}
+
+	response := run(t, s,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"context_for_task","arguments":{"task":"continue the release","taskKey":"REL-42","repo":"acme/app"}}}`,
+	)
+	packet := toolPayload(t, response[0])
+	checkpoints := packet["sections"].(map[string]any)["checkpoints"].([]any)
+	if len(checkpoints) != 1 {
+		t.Fatalf("checkpoints = %d, want latest one", len(checkpoints))
+	}
+	got := checkpoints[0].(map[string]any)
+	if got["ref"] != secondPayload["versionedRef"] || !strings.Contains(got["content"].(string), "Notarization is done") {
+		t.Errorf("latest checkpoint not served: %v", got)
+	}
+}
+
+func TestMutationValidationErrorsAreToolContent(t *testing.T) {
+	s := newServer(t)
+	got := run(t, s,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remember_explicit","arguments":{"text":"remember this","scope":"repo"}}}`,
+	)
+	if _, isErr := got[0]["error"]; isErr {
+		t.Fatal("scope validation produced a JSON-RPC error")
+	}
+	payload := toolPayload(t, got[0])
+	if !strings.Contains(payload["error"].(string), "requires repo") {
+		t.Errorf("unexpected validation payload: %v", payload)
+	}
+}
+
+func toolPayload(t *testing.T, response map[string]any) map[string]any {
+	t.Helper()
+	result, ok := response["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("response has no result: %v", response)
+	}
+	content := result["content"].([]any)
+	text := content[0].(map[string]any)["text"].(string)
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("tool payload is not JSON: %v\n%s", err, text)
+	}
+	return payload
 }
 
 // The response payload is a JSON string inside a text block, not MCP structured
@@ -171,5 +277,17 @@ func TestResponseShapeIsSingleTextBlock(t *testing.T) {
 	}
 	if content[0].(map[string]any)["type"] != "text" {
 		t.Errorf("block type = %v, want text", content[0].(map[string]any)["type"])
+	}
+}
+
+func TestOversizedProtocolFrameIsRejectedBeforeDispatch(t *testing.T) {
+	s := newServer(t)
+	var out bytes.Buffer
+	err := s.Serve(context.Background(), strings.NewReader(strings.Repeat("x", maxFrameBytes+1)+"\n"), &out)
+	if err == nil || !strings.Contains(err.Error(), "maximum") {
+		t.Fatalf("oversized frame error = %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("oversized frame emitted protocol output: %q", out.String())
 	}
 }
