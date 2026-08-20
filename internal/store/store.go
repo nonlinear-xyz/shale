@@ -51,6 +51,20 @@ const (
 
 	KindArtifactRetracted = "artifact.retracted"
 	KindArtifactPurged    = "artifact.purged"
+
+	KindSkillLibraryImported    = "skill.library_imported"
+	KindSkillLibraryRegistered  = "skill.library_registered"
+	KindSkillRevisionIndexed    = "skill.revision_indexed"
+	KindSkillRetracted          = "skill.retracted"
+	KindSkillChangeProposed     = "skill.change_proposed"
+	KindSkillChangeAccepted     = "skill.change_accepted"
+	KindSkillChangeRejected     = "skill.change_rejected"
+	KindSkillChangeReplacement  = "skill.change_replacement_attached"
+	KindSkillChangeMaterialized = "skill.change_materialized"
+	KindSkillChangeApplied      = "skill.change_applied"
+	KindSkillChangeStale        = "skill.change_stale"
+	KindSkillTargetAdded        = "skill.target_added"
+	KindSkillInstalled          = "skill.installed"
 )
 
 // DB wraps the local store.
@@ -203,6 +217,15 @@ func (d *DB) migrate() error {
 		}
 		if _, err := tx.Exec(`PRAGMA user_version = 1`); err != nil {
 			return fmt.Errorf("record schema version: %w", err)
+		}
+		version = 1
+	}
+	if version < 2 {
+		if _, err := tx.Exec(skillSchema); err != nil {
+			return fmt.Errorf("migrate skills: %w", err)
+		}
+		if _, err := tx.Exec(`PRAGMA user_version = 2`); err != nil {
+			return fmt.Errorf("record skill schema version: %w", err)
 		}
 	}
 
@@ -999,6 +1022,10 @@ type Stats struct {
 	Runbooks     int
 	Instructions int
 	Sources      int
+	SkillLibraries int
+	Skills         int
+	SkillChanges   int
+	SkillInstalls  int
 	OldestAt     string
 	NewestAt     string
 	TotalTurns   int
@@ -1018,11 +1045,16 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 		  (SELECT count(*) FROM artifacts WHERE kind = 'runbook' AND status = 'active'),
 		  (SELECT count(*) FROM artifacts WHERE kind = 'instruction' AND status = 'active'),
 		  (SELECT count(*) FROM artifact_sources),
+		  (SELECT count(*) FROM skill_libraries),
+		  (SELECT count(*) FROM skills WHERE status = 'active'),
+		  (SELECT count(*) FROM skill_changes WHERE status IN ('pending', 'accepted', 'materialized')),
+		  (SELECT count(*) FROM skill_installations),
 		  (SELECT coalesce(min(occurred_at), '') FROM events),
 		  (SELECT coalesce(max(occurred_at), '') FROM events)`,
 		KindSessionCaptured, KindSessionCaptured,
 	).Scan(&s.Events, &s.Sessions, &s.Repos, &s.Chunks, &s.Memories,
 		&s.Proposals, &s.Checkpoints, &s.Runbooks, &s.Instructions, &s.Sources,
+		&s.SkillLibraries, &s.Skills, &s.SkillChanges, &s.SkillInstalls,
 		&s.OldestAt, &s.NewestAt)
 	return s, err
 }
