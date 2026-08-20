@@ -31,8 +31,8 @@ func TestArtifactMigrationUpgradesVersionZeroStore(t *testing.T) {
 	if err := db.sql.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 {
-		t.Fatalf("schema version = %d, want 1", version)
+	if version != 2 {
+		t.Fatalf("schema version = %d, want 2", version)
 	}
 	if _, _, err := db.PutArtifact(context.Background(), ArtifactInput{
 		Kind: ArtifactMemory, ScopeKind: ScopeUser,

@@ -22,6 +22,7 @@ import (
 
 	"github.com/nonlinear-xyz/shale/internal/buildinfo"
 	"github.com/nonlinear-xyz/shale/internal/pack"
+	skillops "github.com/nonlinear-xyz/shale/internal/skills"
 	"github.com/nonlinear-xyz/shale/internal/store"
 )
 
@@ -31,7 +32,7 @@ const protocolVersion = "2024-11-05"
 // Stdio MCP frames are one JSON value per line. Artifact bodies are capped at
 // 64 KiB, so a 1 MiB frame leaves ample envelope room while preventing an agent
 // from making the server allocate an unbounded request before validation runs.
-const maxFrameBytes = 1 << 20
+const maxFrameBytes = 4 << 20
 
 // Server answers MCP requests from the local store. Mutating tools are narrow by
 // design: direct writes are only for an explicit user request, while inferred
@@ -231,13 +232,42 @@ func toolDefinitions() []map[string]any {
 		},
 		{
 			"name":        "read_ref",
-			"description": "Resolve a Shale citation and provenance. Returns content for memory, checkpoint, runbook, instruction, and chunk refs; session refs return session metadata. Supports exact artifact versions such as memory:<id>@<eventSeq>.",
+			"description": "Resolve a Shale citation and provenance. Skill refs return the exact core SKILL.md plus compact refs for bundled files; skill file refs ending in #path return only that file. Also supports memories, checkpoints, runbooks, instructions, chunks, sessions, and skill changes.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"ref": map[string]any{"type": "string", "minLength": 1, "description": "A Shale ref copied from a packet or command"},
 				},
 				"required": []string{"ref"},
+			},
+		},
+		{
+			"name":        "search_skills",
+			"description": "Search the local skill catalog without loading whole skill packages. Returns routing metadata, an excerpt from the relevant exact file, and portable versioned file refs. Read only the files needed with read_ref. SQLite is discovery only; exact files remain authoritative.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query":   map[string]any{"type": "string", "minLength": 1, "description": "Capability, procedure, identifier, or error to find"},
+					"library": map[string]any{"type": "string", "description": "Optional portable library key"},
+					"status":  map[string]any{"type": "string", "enum": []string{"active", "draft"}, "description": "Default: active"},
+					"limit":   map[string]any{"type": "integer", "minimum": 1, "maximum": 50},
+				},
+				"required": []string{"query"},
+			},
+		},
+		{
+			"name":        "propose_skill_change",
+			"description": "Record a newly learned lesson against an exact skill revision for human review. Optionally include one complete replacement SKILL.md. This tool cannot accept, apply, install, commit, push, or mutate the source library; use the human CLI review queue for those actions.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"skillRef":     map[string]any{"type": "string", "minLength": 1, "description": "Stable or exact skill ref"},
+					"lesson":       map[string]any{"type": "string", "minLength": 1, "description": "What was learned and should persist"},
+					"rationale":    map[string]any{"type": "string", "description": "Why the skill should change"},
+					"replacement":  map[string]any{"type": "string", "description": "Optional complete replacement SKILL.md; only this file may be proposed in v1"},
+					"evidenceRefs": stringArraySchema("Shale refs supporting the lesson"),
+				},
+				"required": []string{"skillRef", "lesson"},
 			},
 		},
 	}
@@ -293,6 +323,10 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, *rpcEr
 		return s.saveCheckpoint(ctx, call.Arguments)
 	case "read_ref":
 		return s.readRef(ctx, call.Arguments)
+	case "search_skills":
+		return s.searchSkills(ctx, call.Arguments)
+	case "propose_skill_change":
+		return s.proposeSkillChange(ctx, call.Arguments)
 	default:
 		return nil, &rpcError{Code: -32602, Message: "unknown tool: " + call.Name}
 	}
@@ -391,6 +425,123 @@ func (s *Server) searchEvidence(ctx context.Context, raw json.RawMessage) (any, 
 		})
 	}
 	return jsonResult(map[string]any{"query": args.Query, "results": results}), nil
+}
+
+func (s *Server) searchSkills(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
+	var args struct {
+		Query   string `json:"query"`
+		Library string `json:"library"`
+		Status  string `json:"status"`
+		Limit   int    `json:"limit"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return nil, &rpcError{Code: -32602, Message: "invalid arguments: " + err.Error()}
+	}
+	if err := validateSizedText("query", args.Query, true, 8<<10); err != nil {
+		return toolError(err.Error()), nil
+	}
+	if err := validateSizedText("library", args.Library, false, 240); err != nil {
+		return toolError(err.Error()), nil
+	}
+	status := store.SkillStatus(strings.TrimSpace(args.Status))
+	if status == "" {
+		status = store.SkillActive
+	}
+	if status != store.SkillActive && status != store.SkillDraft {
+		return toolError("status must be active or draft"), nil
+	}
+	if args.Limit <= 0 {
+		args.Limit = 10
+	} else if args.Limit > 50 {
+		args.Limit = 50
+	}
+	hits, err := s.DB.SearchSkills(ctx, args.Query, strings.TrimSpace(args.Library), status, args.Limit)
+	if err != nil {
+		s.logf("search_skills: %v", err)
+		return toolError("skill search failed"), nil
+	}
+	results := make([]map[string]any, 0, len(hits))
+	for _, hit := range hits {
+		exact := store.SkillRef{LibraryKey: hit.LibraryKey, Name: hit.Name, TreeHash: hit.TreeHash}
+		detail, err := s.DB.ResolveSkillRef(ctx, exact)
+		if err != nil {
+			s.logf("search_skills resolve %s: %v", exact.String(), err)
+			continue
+		}
+		files := skillFileSummaries(detail, 25)
+		results = append(results, map[string]any{
+			"ref": exact.String(), "name": hit.Name, "description": hit.Description,
+			"status": hit.Status, "relevantFileRef": hit.FileRef(),
+			"relevantPath": hit.FilePath, "excerpt": hit.Excerpt,
+			"availableFiles": files, "fileCount": len(detail.Files),
+			"filesTruncated": len(files) < len(detail.Files),
+		})
+	}
+	return jsonResult(map[string]any{
+		"query": args.Query, "results": results,
+		"note": "Search excerpts are discovery hints. Read the exact SKILL.md and only needed file refs before following a procedure.",
+	}), nil
+}
+
+func (s *Server) proposeSkillChange(ctx context.Context, raw json.RawMessage) (any, *rpcError) {
+	var args struct {
+		SkillRef     string   `json:"skillRef"`
+		Lesson       string   `json:"lesson"`
+		Rationale    string   `json:"rationale"`
+		Replacement  string   `json:"replacement"`
+		EvidenceRefs []string `json:"evidenceRefs"`
+	}
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return nil, &rpcError{Code: -32602, Message: "invalid arguments: " + err.Error()}
+	}
+	if err := validateSizedText("skillRef", args.SkillRef, true, 512); err != nil {
+		return toolError(err.Error()), nil
+	}
+	if err := validateSizedText("lesson", args.Lesson, true, store.ArtifactContentMax); err != nil {
+		return toolError(err.Error()), nil
+	}
+	if err := validateSizedText("rationale", args.Rationale, false, store.ArtifactContentMax); err != nil {
+		return toolError(err.Error()), nil
+	}
+	if len(args.Replacement) > 1<<20 {
+		return toolError("replacement exceeds 1 MiB"), nil
+	}
+	if len(args.EvidenceRefs) > 100 {
+		return toolError("evidenceRefs has more than 100 items"), nil
+	}
+	ref, err := store.ParseSkillRef(args.SkillRef)
+	if err != nil {
+		return toolError("skillRef is invalid"), nil
+	}
+	change, warnings, err := skillops.ProposeChange(ctx, s.DB, skillops.ProposalInput{
+		Ref: ref, Lesson: args.Lesson, Rationale: args.Rationale,
+		EvidenceRefs: args.EvidenceRefs, Replacement: []byte(args.Replacement),
+		Source: "mcp", Actor: "agent",
+	})
+	if err != nil {
+		s.logf("propose_skill_change: %v", err)
+		return toolError(err.Error()), nil
+	}
+	result := skillChangeSummary(change)
+	result["warnings"] = warnings
+	result["approvalCommand"] = "shale skill proposal accept " + change.Ref()
+	result["message"] = "Proposal saved for human review. No source, installed skill, Git branch, or agent behavior was changed."
+	return jsonResult(result), nil
+}
+
+func skillFileSummaries(detail store.SkillDetail, limit int) []map[string]any {
+	if limit <= 0 || limit > len(detail.Files) {
+		limit = len(detail.Files)
+	}
+	base := store.SkillRef{LibraryKey: detail.LibraryKey, Name: detail.Name, TreeHash: detail.TreeHash}
+	out := make([]map[string]any, 0, limit)
+	for _, file := range detail.Files[:limit] {
+		out = append(out, map[string]any{
+			"path": file.Path, "size": file.Size,
+			"ref": store.SkillFileRef{SkillRef: base, Path: file.Path}.String(),
+		})
+	}
+	return out
 }
 
 type memoryArgs struct {
@@ -568,6 +719,48 @@ func (s *Server) readRef(ctx context.Context, raw json.RawMessage) (any, *rpcErr
 	if value == "" {
 		return toolError("ref is required"), nil
 	}
+	if ref, err := store.ParseSkillFileRef(value); err == nil {
+		body, err := s.DB.ReadSkillFile(ctx, ref.SkillRef, ref.Path)
+		if err != nil {
+			return toolError("skill file ref not found"), nil
+		}
+		return jsonResult(map[string]any{
+			"ref": ref.String(), "kind": "skill-file", "path": ref.Path,
+			"content": string(body),
+			"provenance": map[string]any{
+				"library": ref.LibraryKey, "skill": ref.Name, "treeHash": ref.TreeHash,
+			},
+		}), nil
+	}
+	if ref, err := store.ParseSkillRef(value); err == nil {
+		detail, err := s.DB.ResolveSkillRef(ctx, ref)
+		if err != nil {
+			return toolError("skill ref not found"), nil
+		}
+		exact := store.SkillRef{LibraryKey: detail.LibraryKey, Name: detail.Name, TreeHash: detail.TreeHash}
+		core, err := s.DB.ReadSkillFile(ctx, exact, "SKILL.md")
+		if err != nil {
+			return toolError("skill core file is unavailable"), nil
+		}
+		return jsonResult(map[string]any{
+			"ref": detail.Ref(), "versionedRef": exact.String(), "kind": "skill",
+			"name": detail.Name, "description": detail.Description,
+			"status": detail.Status, "content": string(core),
+			"availableFiles": skillFileSummaries(detail, 25), "fileCount": len(detail.Files),
+			"filesTruncated": len(detail.Files) > 25,
+			"provenance": map[string]any{
+				"library": detail.LibraryKey, "treeHash": detail.TreeHash,
+				"sourceHead": detail.Revision.SourceHead,
+			},
+		}), nil
+	}
+	if ref, err := store.ParseSkillChangeRef(value); err == nil {
+		change, err := s.DB.SkillChange(ctx, ref.ID)
+		if err != nil {
+			return toolError("skill change ref not found"), nil
+		}
+		return jsonResult(skillChangeSummary(change)), nil
+	}
 	if ref, err := store.ParseArtifactRef(value); err == nil {
 		a, err := s.DB.ResolveArtifactRef(ctx, ref)
 		if err != nil {
@@ -622,6 +815,18 @@ func artifactSummary(a store.Artifact) map[string]any {
 	}
 }
 
+func skillChangeSummary(c store.SkillChange) map[string]any {
+	return map[string]any{
+		"ref": c.Ref(), "kind": "skill-change", "status": c.Status,
+		"skillRef": c.SkillRef(), "library": c.LibraryKey, "skill": c.SkillName,
+		"baseTreeHash": c.BaseTreeHash, "baseSourceHead": c.BaseSourceHead,
+		"resultTreeHash": c.ResultTreeHash,
+		"lesson":         c.Lesson, "rationale": c.Rationale, "evidenceRefs": c.EvidenceRefs,
+		"hasReplacement": c.ReplacementBlobHash != "",
+		"createdAt":      c.CreatedAt, "updatedAt": c.UpdatedAt,
+	}
+}
+
 const maxToolStringBytes = store.ArtifactContentMax - 4096
 
 func validateText(name, value string, required bool) error {
@@ -657,6 +862,15 @@ func validateEvidenceRefs(refs []string) error {
 	}
 	for _, value := range refs {
 		if _, err := store.ParseArtifactRef(value); err == nil {
+			continue
+		}
+		if _, err := store.ParseSkillRef(value); err == nil {
+			continue
+		}
+		if _, err := store.ParseSkillFileRef(value); err == nil {
+			continue
+		}
+		if _, err := store.ParseSkillChangeRef(value); err == nil {
 			continue
 		}
 		if _, err := store.ParseRef(value); err != nil {

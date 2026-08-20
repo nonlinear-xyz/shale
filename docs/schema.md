@@ -18,7 +18,7 @@ Append-only, one row per observed fact or state transition:
 | `source` | `claude_code`, `codex`, `git`, `manual`. Open set — new harnesses add values, never columns. |
 | `actor` | Who produced it: `human`, `agent`, `system`. |
 | `occurred_at` | When the fact happened, not when we noticed. |
-| `scope` | Repo full name (`owner/name`) when known, else the absolute path prefix. |
+| `scope` | Repo full name (`owner/name`) when known, else the absolute path prefix. Skill events always use a portable library key. |
 | `pointer` | The blob path the writer recorded. Never the bytes themselves, and never the address a reader should use — see below. |
 | `content_hash` | sha256 of the scrubbed raw bytes this event points at. **This is the address of record.** |
 | `payload` | JSON for the small, query-driving extract. Bounded; the raw stays on disk. |
@@ -52,6 +52,8 @@ tombstone, not the forgotten prose.
   shale.db            SQLite: events, current projections, source registry, FTS5
   blobs/<hash[0:2]>/<hash>.jsonl.gz    scrubbed transcripts, content-addressed
   artifact-blobs/<hash[0:2]>/<hash>.json.gz   scrubbed typed artifact bodies
+  skill-blobs/<hash[0:2]>/<hash>   exact skill-package files, content-addressed
+  worktrees/skill-<id>/             reviewed Git edits awaiting normal Git workflow
 ```
 
 Content-addressing the blobs means a re-captured session that hasn't changed
@@ -76,7 +78,8 @@ the thing most likely to be rewritten:
 - `seq` is `INTEGER PRIMARY KEY AUTOINCREMENT` — never reused, even after the
   highest row is gone, so a replication cursor can never be silently rewound.
 - `PRAGMA user_version` gates additive migrations; version 1 introduces durable
-  artifacts and upgrades a version-zero database in one transaction.
+  artifacts and version 2 introduces skill libraries, revisions, proposals,
+  targets, and installations. Each older database upgrades in one transaction.
 - `secure_delete=ON` is enabled. Hard purge also checkpoints/truncates WAL and
   vacuums database pages after removing FTS content.
 
@@ -134,6 +137,46 @@ snapshot. Registered runbook symlinks must resolve inside their Git worktree;
 auto-discovered sources must resolve inside their trusted memory/instruction
 root.
 
+## Skill libraries and recursive learning
+
+Skills use dedicated projections because an exact multi-file package is not a
+free-form durable artifact. `skill_libraries` records a portable key, future-safe
+`owner_kind` / `owner_key` (`user:local` today, `team:<id>` later), canonical
+mode (`native` or `git`), and local operational source fields. Absolute source,
+install, and worktree paths exist only in projections and never enter events.
+
+`skills` is current state (`draft`, `active`, or `retracted`).
+`skill_revisions` is the immutable revision graph. A revision's SHA-256 tree
+identity is calculated over sorted relative paths, normalized executable bits,
+and exact per-file blob hashes. `skill_revision_files` maps that identity back to
+the exact blobs. This makes the same skill revision portable across checkout
+paths and machines without pretending SQLite chunks are the procedure.
+
+`skill_changes` is the review queue:
+
+1. An agent or human proposes a required scrubbed lesson and optional exact
+   replacement `SKILL.md` against one base tree hash (`pending`).
+2. Only a human transition can accept or reject it. Acceptance does not alter
+   behavior; rejection clears lesson, rationale, evidence, and unshared
+   replacement bytes while retaining a metadata tombstone.
+3. A native apply creates a child revision and becomes `applied`. A Git apply
+   requires the same clean HEAD and exact base tree, creates an isolated
+   uncommitted worktree, and becomes `materialized`. It never rebases, commits,
+   pushes, opens a PR, or executes project-defined commands.
+4. A later refresh observes exact replacement bytes in canonical Git and marks
+   the proposal `applied`. A changed base becomes `stale` and requires a
+   superseding proposal.
+
+`skill_targets` and `skill_installations` are local operational state. Install
+requires an exact `@tree-hash`, stages a complete sibling directory, and refuses
+unmanaged or divergent overwrites. Reinstalling an older exact ref is rollback.
+Plugin cache directories are never write targets.
+
+Skill source bytes do not pass through the memory scrubber: doing so could
+silently corrupt code and ordered procedural constraints. They remain exact and
+local. Proposal prose is scrubbed. A future team transport must perform an
+explicit secret scan and consent check without rewriting the package.
+
 ## What is deliberately absent
 
 No embeddings, local LLM, semantic distiller, automatic proposal approval,
@@ -154,20 +197,24 @@ Keyword search is the whole local retrieval story. It is not a placeholder for
 semantic search — it is the tier that costs nothing, leaks nothing, and cannot
 hallucinate. Ranking that requires a model belongs to the hub.
 
-### Three retrieval indexes
+### Four retrieval indexes
 
-There are three FTS tables, and the difference matters more than it looks:
+There are four FTS tables, and the difference matters more than it looks:
 
 | | rows | holds |
 |---|---|---|
 | `events_fts` | one per session | the digest — title and summary |
 | `chunks_fts` | dozens per session | the transcript bodies |
 | `artifacts_fts` | one per active artifact | memory/checkpoint/runbook/instruction search text |
+| `skills_fts` | one per searchable file in the current skill revision | routing metadata, relevant path, and a discovery excerpt |
 
 Transcript search uses `chunks_fts`. The digest index covers a few percent of
 what was captured, so text plainly in a transcript may be absent from it;
 `events_fts` is for whole-session lookup, not passage retrieval. Explicit
 `--kind memory|checkpoint|runbook|instruction` searches `artifacts_fts`.
+`--kind skill` searches `skills_fts`, but returns compact metadata and an exact
+file ref rather than treating an FTS excerpt as authoritative. Skills remain out
+of `context_for_task`; the normal harness loads explicitly installed skills.
 
 Context assembly uses independent retrieval ladders for checkpoints, memories,
 runbooks, corrections, and raw evidence. An exact task key takes the latest
@@ -185,3 +232,9 @@ session (`session:<seq>`). Durable refs are `memory:<id>`, `checkpoint:<id>`,
 artifact version; omitting it follows the current projection. Packets, CLI
 search, `shale show`, and MCP `read_ref` share these parsers and resolvers. A
 citation format nothing can resolve is decoration, so each direction is tested.
+
+Skill refs are `skill:<library-key>/<skill-name>`; appending `@<tree-hash>` pins
+an exact full-tree revision. A fragment addresses one exact progressively loaded
+file, for example
+`skill:nonlinear-xyz/factory-kit/factory-testing@<tree-hash>#references/details.md`.
+Skill change tombstones use `skill-change:<id>`.

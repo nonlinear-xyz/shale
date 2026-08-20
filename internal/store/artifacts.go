@@ -511,6 +511,15 @@ func validateArtifactInput(in ArtifactInput) error {
 		if _, err := ParseArtifactRef(value); err == nil {
 			continue
 		}
+		if _, err := ParseSkillRef(value); err == nil {
+			continue
+		}
+		if _, err := ParseSkillFileRef(value); err == nil {
+			continue
+		}
+		if _, err := ParseSkillChangeRef(value); err == nil {
+			continue
+		}
 		if _, err := ParseRef(value); err != nil {
 			return fmt.Errorf("invalid evidence ref %q", value)
 		}

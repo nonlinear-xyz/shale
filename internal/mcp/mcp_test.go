@@ -84,10 +84,106 @@ func TestInitializeAndToolsList(t *testing.T) {
 	}
 	for _, want := range []string{
 		"context_for_task", "search_evidence", "remember_explicit",
-		"propose_memory", "save_checkpoint", "read_ref",
+		"propose_memory", "save_checkpoint", "read_ref", "search_skills",
+		"propose_skill_change",
 	} {
 		if !names[want] {
 			t.Errorf("tool %q missing from tools/list", want)
+		}
+	}
+}
+
+func TestSkillToolsUseProgressiveDisclosureAndProposalOnlyMutation(t *testing.T) {
+	s := newServer(t)
+	ctx := context.Background()
+	lib, _, err := s.DB.RegisterSkillLibrary(ctx, store.SkillLibraryInput{
+		Key: "nonlinear-xyz/factory-kit", Kind: store.SkillLibraryNative,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	core := []byte("---\nname: release-guide\ndescription: Guide safe releases\n---\n\n# Release\n\nRead [details](references/details.md).\n")
+	reference := []byte("# Details\n\nThe violet-notarization-marker belongs here.\n")
+	skill, _, _, err := s.DB.PutSkillRevision(ctx, store.SkillRevisionInput{
+		LibraryID: lib.ID, Name: "release-guide", Status: store.SkillActive,
+		Description: "Guide safe releases", Files: []store.SkillFileInput{
+			{Path: "SKILL.md", Content: core, Mode: 0o644},
+			{Path: "references/details.md", Content: reference, Mode: 0o644},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	searched := run(t, s,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_skills","arguments":{"query":"violet-notarization-marker"}}}`,
+	)
+	searchPayload := toolPayload(t, searched[0])
+	results := searchPayload["results"].([]any)
+	if len(results) != 1 {
+		t.Fatalf("skill search results = %d", len(results))
+	}
+	hit := results[0].(map[string]any)
+	fileRef := hit["relevantFileRef"].(string)
+	if !strings.Contains(fileRef, "@"+skill.TreeHash+"#references/details.md") {
+		t.Fatalf("search did not return exact relevant file ref: %v", hit)
+	}
+	if _, loadedWholePackage := hit["content"]; loadedWholePackage {
+		t.Fatalf("search loaded authoritative content instead of metadata: %v", hit)
+	}
+
+	readFile := run(t, s, fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_ref","arguments":{"ref":%q}}}`,
+		fileRef,
+	))
+	filePayload := toolPayload(t, readFile[0])
+	if filePayload["kind"] != "skill-file" || !strings.Contains(filePayload["content"].(string), "violet-notarization-marker") {
+		t.Fatalf("read exact skill file = %v", filePayload)
+	}
+
+	exactRef := skill.VersionedRef()
+	readCore := run(t, s, fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_ref","arguments":{"ref":%q}}}`,
+		exactRef,
+	))
+	corePayload := toolPayload(t, readCore[0])
+	if corePayload["kind"] != "skill" || !strings.Contains(corePayload["content"].(string), "Read [details]") {
+		t.Fatalf("read skill core = %v", corePayload)
+	}
+	if len(corePayload["availableFiles"].([]any)) != 2 {
+		t.Fatalf("available files = %v", corePayload["availableFiles"])
+	}
+	packetResponse := run(t, s,
+		`{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"context_for_task","arguments":{"task":"violet-notarization-marker"}}}`,
+	)
+	packet := toolPayload(t, packetResponse[0])
+	if _, present := packet["skills"]; present {
+		t.Fatalf("task packet duplicated harness-owned skills: %v", packet)
+	}
+	if _, present := packet["sections"].(map[string]any)["skills"]; present {
+		t.Fatalf("task packet sections included skills: %v", packet["sections"])
+	}
+
+	replacement := "---\nname: release-guide\ndescription: Guide safe releases\n---\n\n# Release\n\nUse the safer order and read [details](references/details.md).\n"
+	proposed := run(t, s, fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"propose_skill_change","arguments":{"skillRef":%q,"lesson":"The safer order avoids a failure","replacement":%q}}}`,
+		exactRef, replacement,
+	))
+	proposal := toolPayload(t, proposed[0])
+	if proposal["status"] != string(store.SkillChangePending) || !strings.Contains(proposal["approvalCommand"].(string), "shale skill proposal accept") {
+		t.Fatalf("skill proposal boundary = %v", proposal)
+	}
+	current, err := s.DB.ResolveSkillRef(ctx, store.SkillRef{LibraryKey: lib.Key, Name: skill.Name})
+	if err != nil || current.TreeHash != skill.TreeHash {
+		t.Fatalf("MCP proposal changed active skill: %+v err=%v", current, err)
+	}
+
+	listed := run(t, s, `{"jsonrpc":"2.0","id":5,"method":"tools/list"}`)
+	tools := listed[0]["result"].(map[string]any)["tools"].([]any)
+	for _, raw := range tools {
+		name := raw.(map[string]any)["name"].(string)
+		if name == "accept_skill_change" || name == "apply_skill_change" || name == "install_skill" {
+			t.Fatalf("MCP exposed forbidden human transition %q", name)
 		}
 	}
 }

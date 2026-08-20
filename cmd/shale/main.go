@@ -56,6 +56,7 @@ Usage:
   shale checkpoints         list task handoffs saved by agents
   shale runbook <command>   create, register, revise, or list runbooks
   shale refresh             index Claude/Codex memory and instruction files
+  shale skill <command>     manage versioned local skill libraries and proposals
   shale browse              search, read and audit interactively
   shale status              what has been captured
   shale mcp                 serve context to agents over stdio MCP
@@ -126,6 +127,8 @@ func main() {
 		err = cmdRunbook(ctx, append([]string{"list"}, args...))
 	case "refresh":
 		err = cmdRefresh(ctx, args)
+	case "skill":
+		err = cmdSkill(ctx, args)
 	case "browse":
 		err = cmdBrowse(ctx, args)
 	case "status":
@@ -309,13 +312,14 @@ func cmdSearch(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("search", flag.ExitOnError)
 	limit := fs.Int("limit", 10, "maximum results")
 	repo := fs.String("repo", "", `filter to one repository ("owner/name")`)
-	kind := fs.String("kind", "", `transcript, error, memory, checkpoint, runbook, or instruction`)
+	library := fs.String("library", "", "filter skill search to one library key")
+	kind := fs.String("kind", "", `transcript, error, memory, checkpoint, runbook, instruction, or skill`)
 	taskKey := fs.String("task", "", "filter durable state to a task key")
 	sinceDays := fs.Int("since", 0, "only search sessions from the last N days")
 	// Go's flag package stops parsing at the first positional argument, so
 	// `search worktree --limit 3` would put "--limit 3" INTO the query and search
 	// for it. Nobody types flags before a search term, so reorder first.
-	valued := map[string]bool{"limit": true, "repo": true, "kind": true, "task": true, "since": true}
+	valued := map[string]bool{"limit": true, "repo": true, "library": true, "kind": true, "task": true, "since": true}
 	if err := fs.Parse(reorderFlagsFirst(args, valued)); err != nil {
 		return err
 	}
@@ -331,6 +335,22 @@ func cmdSearch(ctx context.Context, args []string) error {
 	defer db.Close()
 
 	kindValue := strings.TrimSpace(*kind)
+	if kindValue == "skill" {
+		libraryKey := strings.TrimSpace(*library)
+		if libraryKey == "" {
+			libraryKey = strings.TrimSpace(*repo) // compatibility with early skill builds
+		}
+		hits, err := db.SearchSkills(ctx, query, libraryKey, store.SkillActive, *limit)
+		if err != nil {
+			return err
+		}
+		if len(hits) == 0 {
+			fmt.Printf("No skill matches for %q.\n", query)
+			return nil
+		}
+		render.SkillSearchResults(os.Stdout, theme(), query, hits)
+		return nil
+	}
 	artifactKind := store.ArtifactKind(kindValue)
 	switch artifactKind {
 	case store.ArtifactMemory, store.ArtifactCheckpoint, store.ArtifactRunbook, store.ArtifactInstruction:
@@ -348,7 +368,7 @@ func cmdSearch(ctx context.Context, args []string) error {
 		return nil
 	case "", "transcript", "error":
 	default:
-		return fmt.Errorf("unknown --kind %q (want transcript, error, memory, checkpoint, runbook, or instruction)", *kind)
+		return fmt.Errorf("unknown --kind %q (want transcript, error, memory, checkpoint, runbook, instruction, or skill)", *kind)
 	}
 	chunkKind := kindValue
 	if chunkKind == "transcript" {
@@ -398,7 +418,7 @@ func cmdShow(ctx context.Context, args []string) error {
 	}
 	arg := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if arg == "" {
-		return errors.New(`usage: shale show <ref>   (artifact, chunk:<seq>:<index>, session:<seq> or <seq>)`)
+		return errors.New(`usage: shale show <ref>   (skill, artifact, chunk:<seq>:<index>, session:<seq> or <seq>)`)
 	}
 
 	db, err := openStore()
@@ -406,6 +426,43 @@ func cmdShow(ctx context.Context, args []string) error {
 		return err
 	}
 	defer db.Close()
+	if fileRef, parseErr := store.ParseSkillFileRef(arg); parseErr == nil {
+		if *lines != "" {
+			return errors.New("--lines only applies to transcript refs")
+		}
+		body, err := db.ReadSkillFile(ctx, fileRef.SkillRef, fileRef.Path)
+		if err != nil {
+			return err
+		}
+		render.SkillFile(os.Stdout, theme(), fileRef, body)
+		return nil
+	}
+	if skillRef, parseErr := store.ParseSkillRef(arg); parseErr == nil {
+		if *lines != "" {
+			return errors.New("--lines only applies to transcript refs")
+		}
+		detail, err := db.ResolveSkillRef(ctx, skillRef)
+		if err != nil {
+			return err
+		}
+		core, err := db.ReadSkillFile(ctx, store.SkillRef{LibraryKey: detail.LibraryKey, Name: detail.Name, TreeHash: detail.TreeHash}, "SKILL.md")
+		if err != nil {
+			return err
+		}
+		render.SkillDetail(os.Stdout, theme(), detail, core)
+		return nil
+	}
+	if changeRef, parseErr := store.ParseSkillChangeRef(arg); parseErr == nil {
+		if *lines != "" {
+			return errors.New("--lines only applies to transcript refs")
+		}
+		change, err := db.SkillChange(ctx, changeRef.ID)
+		if err != nil {
+			return err
+		}
+		render.SkillChangeDetail(os.Stdout, theme(), change)
+		return nil
+	}
 	if artifactRef, parseErr := store.ParseArtifactRef(arg); parseErr == nil {
 		if *lines != "" {
 			return errors.New("--lines only applies to transcript refs")
@@ -548,6 +605,10 @@ func cmdStatus(ctx context.Context, args []string) error {
 		{"active runbooks", fmt.Sprint(st.Runbooks)},
 		{"indexed instructions", fmt.Sprint(st.Instructions)},
 		{"watched sources", fmt.Sprint(st.Sources)},
+		{"skill libraries", fmt.Sprint(st.SkillLibraries)},
+		{"active skills", fmt.Sprint(st.Skills)},
+		{"open skill changes", fmt.Sprint(st.SkillChanges)},
+		{"skill installations", fmt.Sprint(st.SkillInstalls)},
 	}
 	if st.OldestAt != "" {
 		rows = append(rows, [2]string{"span", st.OldestAt + " → " + st.NewestAt})
@@ -556,7 +617,7 @@ func cmdStatus(ctx context.Context, args []string) error {
 
 	if st.Sessions == 0 {
 		message := "No agent sessions captured yet. Run `shale watch`."
-		if st.Memories+st.Proposals+st.Checkpoints+st.Runbooks+st.Instructions == 0 {
+		if st.Memories+st.Proposals+st.Checkpoints+st.Runbooks+st.Instructions+st.Skills+st.SkillChanges == 0 {
 			message = "Nothing captured yet. Run `shale watch` or `shale remember`."
 		}
 		fmt.Println("\n" + th.Warn.Render(message))

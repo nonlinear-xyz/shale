@@ -230,6 +230,10 @@ func (m Model) statusPane() string {
 		{"active runbooks", fmt.Sprint(m.stats.Runbooks)},
 		{"indexed instructions", fmt.Sprint(m.stats.Instructions)},
 		{"watched sources", fmt.Sprint(m.stats.Sources)},
+		{"skill libraries", fmt.Sprint(m.stats.SkillLibraries)},
+		{"active skills", fmt.Sprint(m.stats.Skills)},
+		{"open skill changes", fmt.Sprint(m.stats.SkillChanges)},
+		{"skill installations", fmt.Sprint(m.stats.SkillInstalls)},
 	}
 	if m.stats.OldestAt != "" {
 		rows = append(rows, [2]string{"span", m.stats.OldestAt + " → " + m.stats.NewestAt})
@@ -242,7 +246,7 @@ func (m Model) statusPane() string {
 
 	if m.stats.Sessions == 0 {
 		message := "No agent sessions captured yet. Run `shale watch`."
-		if m.stats.Memories+m.stats.Proposals+m.stats.Checkpoints+m.stats.Runbooks+m.stats.Instructions == 0 {
+		if m.stats.Memories+m.stats.Proposals+m.stats.Checkpoints+m.stats.Runbooks+m.stats.Instructions+m.stats.Skills+m.stats.SkillChanges == 0 {
 			message = "Nothing captured yet. Run `shale watch` or `shale remember`."
 		}
 		b.WriteString("\n" + m.th.Warn.Render(message) + "\n")

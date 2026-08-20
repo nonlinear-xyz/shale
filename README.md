@@ -4,8 +4,9 @@ Local memory for coding agents.
 
 Your agents forget everything, and each new one starts from zero. shale captures
 agent sessions, stores explicit memories and task handoffs, indexes the memory
-files your harnesses already maintain, and serves the useful slice back to any
-agent over MCP. The entire loop is local and model-free.
+files your harnesses already maintain, and manages reviewed, versioned skill
+libraries. It serves the useful slice back to any agent over MCP. The entire
+loop is local and model-free.
 
 ```sh
 shale                    # open the browser
@@ -19,6 +20,7 @@ shale proposals          # review inferred memories waiting for approval
 shale checkpoints        # list resumable task handoffs
 shale runbook list       # list personal and Git-backed runbooks
 shale refresh            # snapshot Claude/Codex memory and instruction files
+shale skill --help       # import, search, improve, review, and install skills
 shale browse             # search, read and audit interactively
 shale status             # what has been captured
 shale mcp                # serve and record agent state over stdio MCP
@@ -55,7 +57,7 @@ Or commit a project-level `.mcp.json` for Claude Code:
 { "mcpServers": { "shale": { "type": "stdio", "command": "shale", "args": ["mcp"] } } }
 ```
 
-Six tools, with a deliberately narrow mutation boundary:
+Eight tools, with a deliberately narrow mutation boundary:
 
 - **`context_for_task`** — call at the start of work. Returns a bounded packet of
   the latest task checkpoint, approved memories, relevant runbooks, prior
@@ -68,7 +70,12 @@ Six tools, with a deliberately narrow mutation boundary:
   enter retrieval until a person runs `shale accept memory:<id>`.
 - **`save_checkpoint`** — writes a structured, task-keyed handoff and chains it to
   the previous checkpoint for that task.
-- **`read_ref`** — resolves exact artifact versions and transcript citations.
+- **`read_ref`** — resolves exact artifact, transcript, skill, and skill-file
+  citations.
+- **`search_skills`** — returns compact routing metadata, a relevant per-file
+  excerpt, and exact file refs without loading whole skill packages.
+- **`propose_skill_change`** — records a lesson and optional complete replacement
+  `SKILL.md` for human review. It cannot approve, apply, install, commit, or push.
 
 An agent cannot approve its own proposal through MCP. That asymmetry is the
 point: explicit instructions can become state immediately; inferred state has a
@@ -89,6 +96,11 @@ when one exists. Treat `recency_fallback` packets with low confidence. Only call
 durable knowledge in `propose_memory`. Save a checkpoint at meaningful stopping
 points on work that will continue later.
 ```
+
+When a task reveals a reusable improvement to an installed skill, use
+`search_skills` to resolve its exact revision and `propose_skill_change` to put
+the lesson in review. Read only the referenced files needed for the task; do not
+treat a search excerpt as the complete procedure.
 
 ## Memories and checkpoints
 
@@ -155,6 +167,64 @@ Claude's configured `autoMemoryDirectory` or
 and [Claude Code memory documentation](https://code.claude.com/docs/en/memory)
 for the canonical path semantics.
 
+## Recursive skill learning
+
+Shale supports two canonical ownership modes without writing into installed
+plugin caches:
+
+```sh
+# Personal: import exact package trees into Shale's native blob/revision store.
+shale skill library import ~/.agents/skills --name personal
+
+# Existing team library: keep Git canonical and register a clean committed root.
+shale skill library register ~/src/factory-kit --root skills
+
+shale skill list --library personal
+shale search "database migration" --kind skill --library nonlinear-xyz/factory-kit
+shale show 'skill:nonlinear-xyz/factory-kit/factory-db-migration@<tree-hash>'
+```
+
+An imported loose Markdown file becomes an inactive draft. It needs a confirmed
+name/description before `shale skill activate` creates an active revision. Full
+skill directories retain `SKILL.md`, scripts, references, assets, binary bytes,
+and executable bits in one portable SHA-256 tree identity.
+
+Learning is a review queue, not a self-editing loop:
+
+```sh
+shale skill propose skill:personal/release-guide \
+  --lesson "Notarization must follow signing" \
+  --replacement revised-SKILL.md
+shale skill proposal show skill-change:<id>
+shale skill proposal accept skill-change:<id>
+shale skill apply skill-change:<id>
+```
+
+Accepting a lesson alone changes no behavior. Applying an accepted native change
+creates an immutable revision. Applying an accepted Git-backed change creates
+an isolated `shale/skill-<id>` worktree with only the reviewed `SKILL.md` edit;
+it does not commit, push, open a PR, rebase, or run repository commands. A later
+refresh marks it applied only after the canonical Git source contains those
+exact bytes.
+
+Installation is also explicit and exact:
+
+```sh
+shale skill target add codex /absolute/path/to/.codex/skills
+shale skill install 'skill:personal/release-guide@<tree-hash>' --target codex
+```
+
+Shale refuses unmanaged overwrites, divergent managed copies, symlinks, path
+traversal, and plugin-cache targets. Reinstalling an older exact revision is the
+rollback path.
+
+SQLite is the catalog: metadata, ownership, proposal state, relationships, and
+per-file FTS excerpts. Exact files/blobs are authoritative. Search returns the
+matching path plus a ref such as
+`skill:<library>/<name>@<tree-hash>#references/details.md`; `read_ref` or
+`shale show` loads that one file. `context_for_task` intentionally excludes
+skills because the normal agent harness owns installed-skill activation.
+
 ## Search, then read
 
 Search is lexical (FTS5, porter stemming, bm25). Exact identifiers, file names
@@ -180,7 +250,8 @@ $ shale show session:1 --lines 40,90
 `--kind error`, `--repo owner/name` and `--since <days>` narrow transcript
 search. `--kind memory|checkpoint|runbook|instruction` searches durable state;
 artifact results cite an exact version such as `memory:<id>@<eventSeq>`, while
-the versionless ref follows the current state.
+the versionless ref follows the current state. `--kind skill [--library key]`
+searches per-file skill metadata and text, returning compact exact file refs.
 
 ## Browsing
 
@@ -258,7 +329,8 @@ opt-in.
 
 ## Secrets
 
-Transcripts, native memories, checkpoints, runbooks, and external snapshots are
+Transcripts, native memories, checkpoints, runbooks, external snapshots, and
+skill-proposal prose are
 scrubbed **before** they are hashed or stored — nine named rules (cloud keys,
 tokens, JWTs, PEM blocks, `SECRET=`-shaped assignments) plus a Shannon-entropy
 catch-all. Redactions are stable: the same secret produces the same placeholder
@@ -267,6 +339,11 @@ value being recoverable.
 
 Per-rule counts are recorded so you can audit what was caught. The values never
 are.
+
+Skill package and replacement bytes are the exception: Shale preserves them
+exactly because redacting code or procedural instructions would silently corrupt
+behavior. They remain local in the v1 design. Any future team upload must add an
+explicit secret scan and consent boundary rather than mutating canonical bytes.
 
 ## Design
 

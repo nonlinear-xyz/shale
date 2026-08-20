@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -54,6 +56,8 @@ CREATE TABLE IF NOT EXISTS skill_revisions (
   skill_name      TEXT NOT NULL,
   tree_hash       TEXT NOT NULL,
   parent_tree_hash TEXT NOT NULL DEFAULT '',
+  status          TEXT NOT NULL,
+  description     TEXT NOT NULL DEFAULT '',
   source_head     TEXT NOT NULL DEFAULT '',
   event_seq       INTEGER NOT NULL,
   created_at      TEXT NOT NULL,
@@ -81,6 +85,7 @@ CREATE TABLE IF NOT EXISTS skill_changes (
   library_id           TEXT NOT NULL,
   skill_name           TEXT NOT NULL,
   base_tree_hash       TEXT NOT NULL,
+  base_source_head     TEXT NOT NULL DEFAULT '',
   result_tree_hash     TEXT NOT NULL DEFAULT '',
   status               TEXT NOT NULL,
   lesson               TEXT,
@@ -123,7 +128,7 @@ CREATE TABLE IF NOT EXISTS skill_installations (
 CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
   name, description, body,
   library_id UNINDEXED, library_key UNINDEXED,
-  status UNINDEXED, tree_hash UNINDEXED, path UNINDEXED, updated_at UNINDEXED,
+  status UNINDEXED, tree_hash UNINDEXED, path, updated_at UNINDEXED,
   tokenize='porter unicode61'
 );
 `
@@ -196,6 +201,8 @@ type SkillRevision struct {
 	SkillName      string
 	TreeHash       string
 	ParentTreeHash string
+	Status         SkillStatus
+	Description    string
 	SourceHead     string
 	EventSeq       int64
 	CreatedAt      string
@@ -423,13 +430,21 @@ func (d *DB) RegisterSkillLibrary(ctx context.Context, in SkillLibraryInput) (Sk
 	if in.Actor == "" {
 		in.Actor = "human"
 	}
+	in.Remote = strings.TrimSpace(in.Remote)
+	if filepath.IsAbs(in.Remote) || strings.HasPrefix(strings.ToLower(in.Remote), "file:") {
+		// Local remotes are operational checkout details, not portable identity.
+		in.Remote = ""
+	} else if parsed, parseErr := url.Parse(in.Remote); parseErr == nil && parsed.Host != "" {
+		parsed.User, parsed.RawQuery, parsed.Fragment = nil, "", ""
+		in.Remote = parsed.String()
+	}
 	if !ValidLibraryKey(in.Key) {
 		return SkillLibrary{}, false, fmt.Errorf("invalid library key %q", in.Key)
 	}
 	if in.OwnerKind != "user" && in.OwnerKind != "team" {
 		return SkillLibrary{}, false, errors.New("library owner kind must be user or team")
 	}
-	if in.OwnerKey == "" || len(in.OwnerKey) > 240 {
+	if !validArtifactID(in.OwnerKey) {
 		return SkillLibrary{}, false, errors.New("library owner key is invalid")
 	}
 	if in.Kind != SkillLibraryNative && in.Kind != SkillLibraryGit {
@@ -460,7 +475,7 @@ func (d *DB) RegisterSkillLibrary(ctx context.Context, in SkillLibraryInput) (Sk
 	lib := SkillLibrary{
 		ID: randomID(), Key: in.Key, OwnerKind: in.OwnerKind, OwnerKey: in.OwnerKey,
 		Kind: in.Kind, SourcePath: in.SourcePath, SkillsRoot: in.SkillsRoot,
-		Remote: strings.TrimSpace(in.Remote), Head: strings.TrimSpace(in.Head),
+		Remote: in.Remote, Head: strings.TrimSpace(in.Head),
 		CreatedAt: stamp, UpdatedAt: stamp,
 	}
 	eventKind := KindSkillLibraryImported
@@ -603,6 +618,18 @@ func revisionHashes(files []SkillFileInput) (string, []SkillRevisionFile) {
 	return hex.EncodeToString(h.Sum(nil)), rows
 }
 
+// ComputeSkillTreeHash applies the same portable path/mode normalization used
+// by persisted revisions. Install verification and Git stale checks call this
+// instead of reimplementing the tree identity algorithm.
+func ComputeSkillTreeHash(files []SkillFileInput) (string, error) {
+	normalized, err := normalizeRevisionFiles(files)
+	if err != nil {
+		return "", err
+	}
+	hash, _ := revisionHashes(normalized)
+	return hash, nil
+}
+
 func (d *DB) PutSkillRevision(ctx context.Context, in SkillRevisionInput) (Skill, SkillRevision, bool, error) {
 	in.Name, in.Description = strings.TrimSpace(in.Name), strings.TrimSpace(in.Description)
 	if in.Actor == "" {
@@ -629,6 +656,21 @@ func (d *DB) PutSkillRevision(ctx context.Context, in SkillRevisionInput) (Skill
 		return Skill{}, SkillRevision{}, false, err
 	}
 	treeHash, rows := revisionHashes(files)
+	var current Skill
+	current.LibraryID, current.LibraryKey, current.Name = in.LibraryID, lib.Key, in.Name
+	currentErr := d.sql.QueryRowContext(ctx, `
+		SELECT status, description, current_tree_hash, current_event_seq, created_at, updated_at
+		FROM skills WHERE library_id = ? AND name = ?`, in.LibraryID, in.Name).
+		Scan(&current.Status, &current.Description, &current.TreeHash, &current.EventSeq,
+			&current.CreatedAt, &current.UpdatedAt)
+	if currentErr != nil && currentErr != sql.ErrNoRows {
+		return Skill{}, SkillRevision{}, false, currentErr
+	}
+	if in.ParentTreeHash == "" {
+		if currentErr == nil && current.TreeHash != treeHash {
+			in.ParentTreeHash = current.TreeHash
+		}
+	}
 	for i, file := range files {
 		if err := writeExactFile(d.SkillBlobPath(rows[i].BlobHash), file.Content); err != nil {
 			return Skill{}, SkillRevision{}, false, fmt.Errorf("write skill blob %s: %w", file.Path, err)
@@ -644,6 +686,11 @@ func (d *DB) PutSkillRevision(ctx context.Context, in SkillRevisionInput) (Skill
 		return Skill{}, SkillRevision{}, false, err
 	}
 	inserted := err == sql.ErrNoRows
+	if !inserted && currentErr == nil && current.TreeHash == treeHash &&
+		current.Status == in.Status && current.Description == in.Description {
+		detail, err := d.ResolveSkillRef(ctx, SkillRef{LibraryKey: lib.Key, Name: in.Name, TreeHash: treeHash})
+		return detail.Skill, detail.Revision, false, err
+	}
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return Skill{}, SkillRevision{}, false, err
@@ -676,9 +723,10 @@ func (d *DB) PutSkillRevision(ctx context.Context, in SkillRevisionInput) (Skill
 		}
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO skill_revisions
-			  (library_id, skill_name, tree_hash, parent_tree_hash, source_head, event_seq, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`, in.LibraryID, in.Name, treeHash,
-			in.ParentTreeHash, in.SourceHead, eventSeq, stamp)
+			  (library_id, skill_name, tree_hash, parent_tree_hash, status,
+			   description, source_head, event_seq, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, in.LibraryID, in.Name, treeHash,
+			in.ParentTreeHash, in.Status, in.Description, in.SourceHead, eventSeq, stamp)
 		if err != nil {
 			return Skill{}, SkillRevision{}, false, err
 		}
@@ -692,10 +740,26 @@ func (d *DB) PutSkillRevision(ctx context.Context, in SkillRevisionInput) (Skill
 			}
 		}
 	} else {
+		payload := map[string]any{
+			"libraryId": lib.ID, "libraryKey": lib.Key, "skillName": in.Name,
+			"treeHash": treeHash, "parentTreeHash": in.ParentTreeHash,
+			"status": in.Status, "sourceHead": in.SourceHead, "reusedRevision": true,
+		}
+		eventSeq, err = appendSkillEvent(ctx, tx, KindSkillRevisionIndexed, in.Actor, lib.Key, treeHash, payload)
+		if err != nil {
+			return Skill{}, SkillRevision{}, false, err
+		}
 		_, err = tx.ExecContext(ctx, `
 			UPDATE skills SET status = ?, description = ?, current_tree_hash = ?,
 			  current_event_seq = ?, updated_at = ? WHERE library_id = ? AND name = ?`,
 			in.Status, in.Description, treeHash, eventSeq, stamp, in.LibraryID, in.Name)
+		if err != nil {
+			return Skill{}, SkillRevision{}, false, err
+		}
+		_, err = tx.ExecContext(ctx, `
+			UPDATE skill_revisions SET status = ?, description = ?
+			WHERE library_id = ? AND skill_name = ? AND tree_hash = ?`,
+			in.Status, in.Description, in.LibraryID, in.Name, treeHash)
 		if err != nil {
 			return Skill{}, SkillRevision{}, false, err
 		}
@@ -705,7 +769,7 @@ func (d *DB) PutSkillRevision(ctx context.Context, in SkillRevisionInput) (Skill
 	}
 	indexed := 0
 	for _, file := range files {
-		if in.Status == SkillRetracted || !utf8.Valid(file.Content) || len(file.Content) > 1<<20 {
+		if in.Status == SkillRetracted || !utf8.Valid(file.Content) || bytes.IndexByte(file.Content, 0) >= 0 || len(file.Content) > 1<<20 {
 			continue
 		}
 		_, err = tx.ExecContext(ctx, `
@@ -731,14 +795,8 @@ func (d *DB) PutSkillRevision(ctx context.Context, in SkillRevisionInput) (Skill
 	if err := tx.Commit(); err != nil {
 		return Skill{}, SkillRevision{}, false, err
 	}
-	skill := Skill{LibraryID: in.LibraryID, LibraryKey: lib.Key, Name: in.Name,
-		Status: in.Status, Description: in.Description, TreeHash: treeHash,
-		EventSeq: eventSeq, CreatedAt: stamp, UpdatedAt: stamp}
-	_ = d.sql.QueryRowContext(ctx, `SELECT created_at FROM skills WHERE library_id = ? AND name = ?`, in.LibraryID, in.Name).Scan(&skill.CreatedAt)
-	revision := SkillRevision{LibraryID: in.LibraryID, LibraryKey: lib.Key,
-		SkillName: in.Name, TreeHash: treeHash, ParentTreeHash: in.ParentTreeHash,
-		SourceHead: in.SourceHead, EventSeq: eventSeq, CreatedAt: stamp}
-	return skill, revision, inserted, nil
+	detail, err := d.ResolveSkillRef(ctx, SkillRef{LibraryKey: lib.Key, Name: in.Name, TreeHash: treeHash})
+	return detail.Skill, detail.Revision, inserted, err
 }
 
 type SkillFilter struct {
@@ -803,17 +861,19 @@ func (d *DB) ResolveSkillRef(ctx context.Context, ref SkillRef) (SkillDetail, er
 		return SkillDetail{}, err
 	}
 	tree := ref.TreeHash
+	exact := tree != ""
 	if tree == "" {
 		tree = s.TreeHash
 	}
 	var rev SkillRevision
 	err = d.sql.QueryRowContext(ctx, `
-		SELECT library_id, ?, skill_name, tree_hash, parent_tree_hash,
-		       source_head, event_seq, created_at
+		SELECT library_id, ?, skill_name, tree_hash, parent_tree_hash, status,
+		       description, source_head, event_seq, created_at
 		FROM skill_revisions WHERE library_id = ? AND skill_name = ? AND tree_hash = ?`,
 		lib.Key, lib.ID, ref.Name, tree).
 		Scan(&rev.LibraryID, &rev.LibraryKey, &rev.SkillName, &rev.TreeHash,
-			&rev.ParentTreeHash, &rev.SourceHead, &rev.EventSeq, &rev.CreatedAt)
+			&rev.ParentTreeHash, &rev.Status, &rev.Description, &rev.SourceHead,
+			&rev.EventSeq, &rev.CreatedAt)
 	if err == sql.ErrNoRows {
 		return SkillDetail{}, ErrSkillNotFound
 	}
@@ -824,8 +884,12 @@ func (d *DB) ResolveSkillRef(ctx context.Context, ref SkillRef) (SkillDetail, er
 	if err != nil {
 		return SkillDetail{}, err
 	}
-	// An exact ref describes that revision even when it is not current.
-	s.TreeHash, s.EventSeq = tree, rev.EventSeq
+	// An exact ref describes that revision even when it is not current. A stable
+	// ref keeps current projection state (notably retracted) while still loading
+	// the current revision's immutable files.
+	if exact {
+		s.TreeHash, s.EventSeq, s.Status, s.Description = tree, rev.EventSeq, rev.Status, rev.Description
+	}
 	return SkillDetail{Skill: s, Revision: rev, Files: files}, nil
 }
 

@@ -13,6 +13,7 @@ package render
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -224,6 +225,139 @@ func ArtifactDetail(w io.Writer, t *ui.Theme, a store.Artifact) {
 		return
 	}
 	fmt.Fprintln(w, body)
+}
+
+// SkillLibraries prints local catalog entries. Source paths are shown only on
+// this human-facing local surface; they are never part of portable events.
+func SkillLibraries(w io.Writer, t *ui.Theme, libraries []store.SkillLibrary) {
+	if len(libraries) == 0 {
+		fmt.Fprintln(w, "No skill libraries.")
+		return
+	}
+	fmt.Fprintf(w, "\n%s.\n\n", t.Count.Render(CountPhrase(len(libraries), "skill library", "skill libraries")))
+	for _, lib := range libraries {
+		facts := []string{string(lib.Kind), lib.OwnerKind + ":" + lib.OwnerKey}
+		if lib.Remote != "" {
+			facts = append(facts, lib.Remote)
+		}
+		if lib.Head != "" {
+			facts = append(facts, lib.Head[:min(12, len(lib.Head))])
+		}
+		fmt.Fprintf(w, "  %s\n", t.Title.Render(lib.Key))
+		fmt.Fprintf(w, "    %s\n", t.Facts.Render(strings.Join(facts, " · ")))
+		if lib.SourcePath != "" {
+			fmt.Fprintf(w, "    %s\n", t.Facts.Render(filepath.Join(lib.SourcePath, filepath.FromSlash(lib.SkillsRoot))))
+		}
+		fmt.Fprintln(w)
+	}
+}
+
+func Skills(w io.Writer, t *ui.Theme, items []store.Skill) {
+	if len(items) == 0 {
+		fmt.Fprintln(w, "No skills.")
+		return
+	}
+	fmt.Fprintf(w, "\n%s.\n\n", t.Count.Render(CountPhrase(len(items), "skill", "skills")))
+	for _, skill := range items {
+		fmt.Fprintf(w, "  %s\n", t.Title.Render(skill.Name))
+		fmt.Fprintf(w, "    %s\n", t.Facts.Render(strings.Join([]string{skill.LibraryKey, string(skill.Status), shortHash(skill.TreeHash)}, " · ")))
+		if skill.Description != "" {
+			fmt.Fprintf(w, "    %s\n", oneLine(skill.Description, 180))
+		}
+		fmt.Fprintf(w, "    %s\n\n", t.Ref.Render(skill.VersionedRef()))
+	}
+}
+
+// SkillSearchResults is intentionally compact. SQLite finds the relevant file
+// and excerpt; the exact file ref lets the agent or human opt into those bytes.
+func SkillSearchResults(w io.Writer, t *ui.Theme, query string, hits []store.SkillHit) {
+	fmt.Fprintf(w, "\n%s for %q.\n\n", t.Count.Render(CountPhrase(len(hits), "skill match", "skill matches")), query)
+	terms := queryTerms(query)
+	for _, hit := range hits {
+		fmt.Fprintf(w, "  %s\n", t.Title.Render(hit.Name))
+		fmt.Fprintf(w, "    %s\n", t.Facts.Render(strings.Join([]string{hit.LibraryKey, hit.FilePath, string(hit.Status), shortHash(hit.TreeHash)}, " · ")))
+		if hit.Description != "" {
+			fmt.Fprintf(w, "    %s\n", oneLine(hit.Description, 180))
+		}
+		if hit.Excerpt != "" {
+			fmt.Fprintf(w, "    %s\n", highlight(t, oneLine(hit.Excerpt, 220), terms))
+		}
+		fmt.Fprintf(w, "    %s\n\n", t.Ref.Render("shale show "+hit.FileRef()))
+	}
+}
+
+func SkillDetail(w io.Writer, t *ui.Theme, detail store.SkillDetail, skillMD []byte) {
+	fmt.Fprintf(w, "\n%s\n", t.Title.Render(detail.Name))
+	facts := []string{detail.VersionedRef(), string(detail.Status), detail.LibraryKey, fmt.Sprintf("%d files", len(detail.Files))}
+	fmt.Fprintf(w, "%s\n", t.Facts.Render(strings.Join(facts, " · ")))
+	if detail.Description != "" {
+		fmt.Fprintf(w, "%s\n", detail.Description)
+	}
+	if len(detail.Files) > 1 {
+		fmt.Fprintln(w, "\nAvailable files:")
+		for _, file := range detail.Files {
+			ref := store.SkillFileRef{SkillRef: store.SkillRef{LibraryKey: detail.LibraryKey, Name: detail.Name, TreeHash: detail.TreeHash}, Path: file.Path}
+			fmt.Fprintf(w, "  %s  %s\n", t.Ref.Render(ref.String()), t.Facts.Render(fmt.Sprintf("%d bytes", file.Size)))
+		}
+	}
+	fmt.Fprint(w, "\nSKILL.md:\n\n")
+	fmt.Fprintln(w, string(skillMD))
+}
+
+func SkillFile(w io.Writer, t *ui.Theme, ref store.SkillFileRef, body []byte) {
+	fmt.Fprintf(w, "\n%s\n", t.Title.Render(ref.Path))
+	fmt.Fprintf(w, "%s\n\n", t.Facts.Render(ref.String()))
+	_, _ = w.Write(body)
+	if len(body) == 0 || body[len(body)-1] != '\n' {
+		fmt.Fprintln(w)
+	}
+}
+
+func SkillChanges(w io.Writer, t *ui.Theme, items []store.SkillChange) {
+	if len(items) == 0 {
+		fmt.Fprintln(w, "No skill change proposals.")
+		return
+	}
+	fmt.Fprintf(w, "\n%s.\n\n", t.Count.Render(CountPhrase(len(items), "skill change", "skill changes")))
+	for _, change := range items {
+		fmt.Fprintf(w, "  %s\n", t.Title.Render(change.SkillName))
+		fmt.Fprintf(w, "    %s\n", t.Facts.Render(strings.Join([]string{change.LibraryKey, string(change.Status), shortHash(change.BaseTreeHash)}, " · ")))
+		if change.Lesson != "" {
+			fmt.Fprintf(w, "    %s\n", oneLine(change.Lesson, 200))
+		}
+		fmt.Fprintf(w, "    %s\n\n", t.Ref.Render(change.Ref()))
+	}
+}
+
+func SkillChangeDetail(w io.Writer, t *ui.Theme, change store.SkillChange) {
+	fmt.Fprintf(w, "\n%s\n", t.Title.Render(change.Ref()))
+	facts := []string{change.LibraryKey + "/" + change.SkillName, string(change.Status), "base " + shortHash(change.BaseTreeHash)}
+	if change.ReplacementBlobHash != "" {
+		facts = append(facts, "replacement attached")
+	}
+	fmt.Fprintf(w, "%s\n", t.Facts.Render(strings.Join(facts, " · ")))
+	if change.Lesson != "" {
+		fmt.Fprintf(w, "\nLesson:\n%s\n", change.Lesson)
+	}
+	if change.Rationale != "" {
+		fmt.Fprintf(w, "\nRationale:\n%s\n", change.Rationale)
+	}
+	if len(change.EvidenceRefs) > 0 {
+		fmt.Fprintf(w, "\nEvidence: %s\n", strings.Join(change.EvidenceRefs, ", "))
+	}
+	if change.ResultTreeHash != "" {
+		fmt.Fprintf(w, "\nResult: %s\n", store.SkillRef{LibraryKey: change.LibraryKey, Name: change.SkillName, TreeHash: change.ResultTreeHash}.String())
+	}
+	if change.MaterializedPath != "" {
+		fmt.Fprintf(w, "\nWorktree: %s\nBranch: %s\n", change.MaterializedPath, change.MaterializedBranch)
+	}
+}
+
+func shortHash(hash string) string {
+	if len(hash) <= 12 {
+		return hash
+	}
+	return hash[:12]
 }
 
 func artifactScope(a store.Artifact) string {

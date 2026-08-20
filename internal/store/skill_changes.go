@@ -33,6 +33,7 @@ type SkillChange struct {
 	LibraryKey          string
 	SkillName           string
 	BaseTreeHash        string
+	BaseSourceHead      string
 	ResultTreeHash      string
 	Status              SkillChangeStatus
 	Lesson              string
@@ -135,6 +136,9 @@ func (d *DB) ProposeSkillChange(ctx context.Context, in SkillChangeInput) (Skill
 		ReplacementBlobHash: replacementHash, Source: in.Source, Actor: in.Actor,
 		CreatedAt: stamp, UpdatedAt: stamp,
 	}
+	if lib, libErr := d.SkillLibraryByID(ctx, detail.LibraryID); libErr == nil && lib.Kind == SkillLibraryGit {
+		c.BaseSourceHead = lib.Head
+	}
 	payload := skillChangeEventPayload(c)
 	tx, err := d.sql.BeginTx(ctx, nil)
 	if err != nil {
@@ -148,11 +152,11 @@ func (d *DB) ProposeSkillChange(ctx context.Context, in SkillChangeInput) (Skill
 	c.EventSeq = seq
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO skill_changes
-		  (id, library_id, skill_name, base_tree_hash, result_tree_hash, status,
+		  (id, library_id, skill_name, base_tree_hash, base_source_head, result_tree_hash, status,
 		   lesson, rationale, evidence_refs, replacement_blob_hash, source, actor,
 		   materialized_path, materialized_branch, current_event_seq, created_at, updated_at)
-		VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?)`,
-		c.ID, c.LibraryID, c.SkillName, c.BaseTreeHash, c.Status, c.Lesson,
+		VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?)`,
+		c.ID, c.LibraryID, c.SkillName, c.BaseTreeHash, c.BaseSourceHead, c.Status, c.Lesson,
 		c.Rationale, string(evidence), nullable(c.ReplacementBlobHash), c.Source,
 		c.Actor, c.EventSeq, stamp, stamp)
 	if err != nil {
@@ -173,6 +177,7 @@ func skillChangeEventPayload(c SkillChange) map[string]any {
 	return map[string]any{
 		"changeId": c.ID, "libraryId": c.LibraryID, "libraryKey": c.LibraryKey,
 		"skillName": c.SkillName, "baseTreeHash": c.BaseTreeHash,
+		"baseSourceHead": c.BaseSourceHead,
 		"resultTreeHash": c.ResultTreeHash, "status": c.Status,
 		"hasReplacement": c.ReplacementBlobHash != "",
 	}
@@ -183,13 +188,13 @@ func (d *DB) SkillChange(ctx context.Context, id string) (SkillChange, error) {
 	var lesson, rationale, evidence, replacement sql.NullString
 	err := d.sql.QueryRowContext(ctx, `
 		SELECT c.id, c.library_id, l.key, c.skill_name, c.base_tree_hash,
-		       c.result_tree_hash, c.status, c.lesson, c.rationale, c.evidence_refs,
+		       c.base_source_head, c.result_tree_hash, c.status, c.lesson, c.rationale, c.evidence_refs,
 		       c.replacement_blob_hash, c.source, c.actor, c.materialized_path,
 		       c.materialized_branch, c.current_event_seq, c.created_at, c.updated_at
 		FROM skill_changes c JOIN skill_libraries l ON l.id = c.library_id
 		WHERE c.id = ?`, id).
 		Scan(&c.ID, &c.LibraryID, &c.LibraryKey, &c.SkillName, &c.BaseTreeHash,
-			&c.ResultTreeHash, &c.Status, &lesson, &rationale, &evidence,
+			&c.BaseSourceHead, &c.ResultTreeHash, &c.Status, &lesson, &rationale, &evidence,
 			&replacement, &c.Source, &c.Actor, &c.MaterializedPath,
 			&c.MaterializedBranch, &c.EventSeq, &c.CreatedAt, &c.UpdatedAt)
 	if err == sql.ErrNoRows {
@@ -399,7 +404,7 @@ func (d *DB) MarkSkillChangeApplied(ctx context.Context, id, resultTreeHash, act
 	if err != nil {
 		return SkillChange{}, err
 	}
-	if actor != "human" && actor != "observer" {
+	if actor != "human" && actor != "system" {
 		return SkillChange{}, errors.New("applying a skill change requires a human action or canonical-source observation")
 	}
 	if c.Status != SkillChangeAccepted && c.Status != SkillChangeMaterialized {
@@ -477,7 +482,7 @@ func (d *DB) ObserveMaterializedSkillChanges(ctx context.Context, libraryID, ski
 		return 0, err
 	}
 	for _, id := range ids {
-		if _, err := d.MarkSkillChangeApplied(ctx, id, treeHash, "observer"); err != nil {
+		if _, err := d.MarkSkillChangeApplied(ctx, id, treeHash, "system"); err != nil {
 			return 0, err
 		}
 	}
