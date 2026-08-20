@@ -1012,23 +1012,23 @@ func (d *DB) SetCursor(ctx context.Context, source string, mtimeMS int64) error 
 
 // Stats summarizes the corpus for `shale status`.
 type Stats struct {
-	Events       int
-	Sessions     int
-	Repos        int
-	Chunks       int
-	Memories     int
-	Proposals    int
-	Checkpoints  int
-	Runbooks     int
-	Instructions int
-	Sources      int
+	Events         int
+	Sessions       int
+	Repos          int
+	Chunks         int
+	Memories       int
+	Proposals      int
+	Checkpoints    int
+	Runbooks       int
+	Instructions   int
+	Sources        int
 	SkillLibraries int
 	Skills         int
 	SkillChanges   int
 	SkillInstalls  int
-	OldestAt     string
-	NewestAt     string
-	TotalTurns   int
+	OldestAt       string
+	NewestAt       string
+	TotalTurns     int
 }
 
 func (d *DB) Stats(ctx context.Context) (Stats, error) {

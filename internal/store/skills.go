@@ -170,15 +170,15 @@ type SkillLibraryInput struct {
 }
 
 type Skill struct {
-	LibraryID  string
-	LibraryKey string
-	Name       string
-	Status     SkillStatus
+	LibraryID   string
+	LibraryKey  string
+	Name        string
+	Status      SkillStatus
 	Description string
-	TreeHash   string
-	EventSeq   int64
-	CreatedAt  string
-	UpdatedAt  string
+	TreeHash    string
+	EventSeq    int64
+	CreatedAt   string
+	UpdatedAt   string
 }
 
 func (s Skill) Ref() string { return "skill:" + s.LibraryKey + "/" + s.Name }
@@ -191,14 +191,14 @@ func (s Skill) VersionedRef() string {
 }
 
 type SkillRevision struct {
-	LibraryID     string
-	LibraryKey    string
-	SkillName     string
-	TreeHash      string
+	LibraryID      string
+	LibraryKey     string
+	SkillName      string
+	TreeHash       string
 	ParentTreeHash string
-	SourceHead    string
-	EventSeq      int64
-	CreatedAt     string
+	SourceHead     string
+	EventSeq       int64
+	CreatedAt      string
 }
 
 type SkillFileInput struct {
@@ -208,14 +208,14 @@ type SkillFileInput struct {
 }
 
 type SkillRevisionInput struct {
-	LibraryID     string
-	Name          string
-	Status        SkillStatus
-	Description   string
+	LibraryID      string
+	Name           string
+	Status         SkillStatus
+	Description    string
 	ParentTreeHash string
-	SourceHead    string
-	Actor         string
-	Files         []SkillFileInput
+	SourceHead     string
+	Actor          string
+	Files          []SkillFileInput
 }
 
 type SkillRevisionFile struct {
@@ -241,7 +241,7 @@ type SkillRef struct {
 // versioned refs so following a reference cannot silently read a newer skill.
 // The fragment form keeps the portable skill identity intact:
 //
-//   skill:owner/library/name@<tree-hash>#references/details.md
+//	skill:owner/library/name@<tree-hash>#references/details.md
 type SkillFileRef struct {
 	SkillRef
 	Path string
@@ -886,8 +886,8 @@ func (d *DB) ReadSkillFile(ctx context.Context, ref SkillRef, path string) ([]by
 type SkillHit struct {
 	Skill
 	FilePath string
-	Excerpt string
-	Score   float64
+	Excerpt  string
+	Score    float64
 }
 
 func (h SkillHit) FileRef() string {
