@@ -283,6 +283,58 @@ func TestUnmappedClaudeProjectMemoryIsNotPromotedToUserScope(t *testing.T) {
 	}
 }
 
+func TestCustomAutoMemoryScopesToCurrentRepo(t *testing.T) {
+	db := testDB(t)
+	home := t.TempDir()
+	repo := t.TempDir()
+	git(t, repo, "init")
+	git(t, repo, "remote", "add", "origin", "https://github.com/acme/widgets.git")
+	write(t, filepath.Join(home, "custom-claude-memory", "MEMORY.md"), "The widgets deploy needs a warm cache.")
+	write(t, filepath.Join(home, ".claude", "settings.json"), `{"autoMemoryDirectory":"~/custom-claude-memory"}`)
+
+	result := Refresh(context.Background(), db, Options{
+		HomeDir: home, CodexHome: filepath.Join(home, ".codex"),
+		ClaudeHome: filepath.Join(home, ".claude"), CurrentDir: repo,
+	})
+	if len(result.Errors) != 0 || result.Indexed != 1 {
+		t.Fatalf("refresh: %+v", result)
+	}
+	items, err := db.ListArtifacts(context.Background(), store.ArtifactFilter{Kind: store.ArtifactMemory})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("memories=%d err=%v", len(items), err)
+	}
+	// A configured autoMemoryDirectory holds one project's facts; it must be
+	// scoped to the active repository, never promoted to global user recall.
+	if items[0].ScopeKind != store.ScopeRepo || items[0].Repo != "acme/widgets" {
+		t.Fatalf("custom auto-memory escaped its repository scope: %+v", items[0])
+	}
+}
+
+func TestCustomAutoMemoryWithoutRepoStaysIsolated(t *testing.T) {
+	db := testDB(t)
+	home := t.TempDir()
+	write(t, filepath.Join(home, "custom-claude-memory", "MEMORY.md"), "A fact with no repository context.")
+	write(t, filepath.Join(home, ".claude", "settings.json"), `{"autoMemoryDirectory":"~/custom-claude-memory"}`)
+
+	// CurrentDir is not inside a git repository, so there is no repo to map to.
+	result := Refresh(context.Background(), db, Options{
+		HomeDir: home, CodexHome: filepath.Join(home, ".codex"),
+		ClaudeHome: filepath.Join(home, ".claude"), CurrentDir: home,
+	})
+	if len(result.Errors) != 0 || result.Indexed != 1 {
+		t.Fatalf("refresh: %+v", result)
+	}
+	items, err := db.ListArtifacts(context.Background(), store.ArtifactFilter{Kind: store.ArtifactMemory})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("memories=%d err=%v", len(items), err)
+	}
+	// Without a repository it stays isolated rather than falling back to global
+	// user scope, which would leak the fact into every unrelated repository.
+	if items[0].ScopeKind != store.ScopeRepo || items[0].Repo != "claude-memory:custom-claude-memory" {
+		t.Fatalf("custom auto-memory without a repo escaped into global scope: %+v", items[0])
+	}
+}
+
 func TestRefreshIgnoresNonTextFilesInMemoryDirectories(t *testing.T) {
 	db := testDB(t)
 	home := t.TempDir()

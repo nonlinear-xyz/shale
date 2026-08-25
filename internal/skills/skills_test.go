@@ -277,6 +277,35 @@ func TestGitApplyCreatesIsolatedUncommittedWorktree(t *testing.T) {
 	}
 }
 
+func TestGitRegistrationSnapshotsRootSkillExcludingGitMetadata(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	// The repo directory basename becomes the single skill's folder name, so it
+	// must match the frontmatter name below.
+	repo := filepath.Join(t.TempDir(), "release-guide")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "init")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Shale Test")
+	mustWrite(t, filepath.Join(repo, "SKILL.md"), validSkill("release-guide", "Guide releases", "Use the safer order."), 0o644)
+	runGit(t, repo, "add", ".")
+	runGit(t, repo, "commit", "-m", "seed root skill")
+	runGit(t, repo, "remote", "add", "origin", "https://github.com/acme/factory-kit.git")
+
+	// The default skillsRoot ("") resolves to the repository root, so the snapshot
+	// walks the worktree root. Its .git metadata is never tracked by git, so
+	// without excluding it the tracked-tree check rejects the whole registration.
+	registered, err := RegisterGitLibrary(ctx, db, repo, "", "")
+	if err != nil {
+		t.Fatalf("root-level single-skill registration failed: %v", err)
+	}
+	if len(registered.Skills) != 1 || registered.Skills[0].Name != "release-guide" {
+		t.Fatalf("registered skills = %+v", registered.Skills)
+	}
+}
+
 func TestGitRegistrationRejectsIgnoredUncommittedSkillFiles(t *testing.T) {
 	ctx := context.Background()
 	db := openTestStore(t)

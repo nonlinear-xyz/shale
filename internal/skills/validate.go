@@ -170,6 +170,12 @@ func SnapshotDir(path, expectedName string) (Snapshot, error) {
 		if path == root {
 			return nil
 		}
+		// Skip VCS metadata: its files are never tracked, so requireTrackedSnapshots
+		// would reject them and its size can blow the snapshot limits. This lets a
+		// single-skill repo whose root holds SKILL.md be snapshotted from its root.
+		if entry.IsDir() && entry.Name() == ".git" {
+			return filepath.SkipDir
+		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return err

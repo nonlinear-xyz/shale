@@ -344,11 +344,22 @@ func collectClaude(opts Options, db *store.DB, ctx context.Context, add func(sou
 			}, Root: memoryDir})
 		})
 	}
+	// A configured autoMemoryDirectory is the override for a single project's
+	// auto-memory location, so it holds project-specific facts and must not
+	// become global user state. Scope it to the current session's repository;
+	// when there is none, keep it isolated rather than promoting it to global
+	// recall (mirrors the unmapped-project handling above).
+	repo, scopeKey := currentRepoScope(opts, cwdRepos)
 	for _, root := range memoryRoots[1:] {
+		memRepo, memScope := repo, scopeKey
+		if memRepo == "" {
+			memRepo = "claude-memory:" + filepath.Base(root)
+			memScope = memRepo
+		}
 		walkTextFiles(root, func(path string) {
 			add(sourceSpec{ArtifactSource: store.ArtifactSource{
 				Path: path, Kind: store.ArtifactMemory,
-				ScopeKind: store.ScopeUser, ScopeKey: "local",
+				ScopeKind: store.ScopeRepo, ScopeKey: memScope, Repo: memRepo,
 				Source: "claude_code", Origin: "claude_memory",
 			}, Root: root})
 		})
@@ -472,6 +483,29 @@ func claudeProjectScope(projectDir string, known map[string]repoInfo) (repo, sco
 		if root != "" {
 			return root, root
 		}
+	}
+	return "", ""
+}
+
+// currentRepoScope resolves the repository for the active session, preferring a
+// known cwd mapping and falling back to live git detection. It mirrors
+// claudeProjectScope's precedence and returns empty strings when the current
+// directory is not inside a repository.
+func currentRepoScope(opts Options, known map[string]repoInfo) (repo, scopeKey string) {
+	if info, ok := known[opts.CurrentDir]; ok {
+		if info.Repo != "" {
+			return info.Repo, info.Repo
+		}
+		if info.Root != "" {
+			return info.Root, info.Root
+		}
+	}
+	root, detectedRepo := gitRootAndRepo(opts.CurrentDir)
+	if detectedRepo != "" {
+		return detectedRepo, detectedRepo
+	}
+	if root != "" {
+		return root, root
 	}
 	return "", ""
 }
