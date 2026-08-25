@@ -3,25 +3,33 @@
 Local memory for coding agents.
 
 Your agents forget everything, and each new one starts from zero. shale captures
-every agent session on your machine — whatever harness wrote it — keeps them in a
-local append-only store, and serves them back to any agent over MCP.
+agent sessions, stores explicit memories and task handoffs, indexes the memory
+files your harnesses already maintain, and serves the useful slice back to any
+agent over MCP. The entire loop is local and model-free.
 
 ```sh
 shale                    # open the browser
 shale repos              # what shale can see on this machine (no network, ever)
 shale watch              # capture settled sessions into the local store
 shale search <query>     # search your own corpus
-shale show <ref>         # read the passage or session a result cites
+shale show <ref>         # resolve a passage, session, or durable-state citation
+shale remember <text>    # save an explicit memory (user, repo, or task scoped)
+shale memories           # list active memories
+shale proposals          # review inferred memories waiting for approval
+shale checkpoints        # list resumable task handoffs
+shale runbook list       # list personal and Git-backed runbooks
+shale refresh            # snapshot Claude/Codex memory and instruction files
 shale browse             # search, read and audit interactively
 shale status             # what has been captured
-shale mcp                # serve context to agents over stdio MCP   (in progress)
+shale mcp                # serve and record agent state over stdio MCP
 shale link               # replicate to a hub for cross-machine joins (in progress)
 ```
 
 Sessions are swept once they have been idle for 30 minutes — a quiet-file
 heuristic, not an end-of-session signal, so a long-running session may be
 captured before it ends and re-captured when it grows. `shale watch --dry-run`
-shows exactly what would be captured, and touches nothing.
+shows exactly what would be captured, and touches nothing. A real watch also
+refreshes registered runbooks and Claude/Codex memory files.
 
 ## Giving it to your agent
 
@@ -47,14 +55,24 @@ Or commit a project-level `.mcp.json` for Claude Code:
 { "mcpServers": { "shale": { "type": "stdio", "command": "shale", "args": ["mcp"] } } }
 ```
 
-Two read-only tools, no mutation surface:
+Six tools, with a deliberately narrow mutation boundary:
 
 - **`context_for_task`** — call at the start of work. Returns a bounded packet of
-  relevant prior passages plus things that went wrong when similar work was
-  attempted before. Every item carries provenance: source, repo, line range in
-  the stored transcript, and freshness.
+  the latest task checkpoint, approved memories, relevant runbooks, prior
+  failures, and transcript evidence. Every item carries provenance and a ref.
 - **`search_evidence`** — a targeted keyword dig, optionally filtered to one repo
   or to `kind: "error"`.
+- **`remember_explicit`** — writes an active memory only when the user explicitly
+  asked the agent to remember something.
+- **`propose_memory`** — records an inference as pending. Pending proposals never
+  enter retrieval until a person runs `shale accept memory:<id>`.
+- **`save_checkpoint`** — writes a structured, task-keyed handoff and chains it to
+  the previous checkpoint for that task.
+- **`read_ref`** — resolves exact artifact versions and transcript citations.
+
+An agent cannot approve its own proposal through MCP. That asymmetry is the
+point: explicit instructions can become state immediately; inferred state has a
+quick human gate.
 
 A packet always reports **how** it retrieved (`match`, `match_or`, or
 `recency_fallback`) and **what it dropped** (`budget.truncated`), so an agent can
@@ -64,10 +82,78 @@ packet for a complete one.
 Add this to your `CLAUDE.md` to make the loop automatic:
 
 ```markdown
-Before starting any nontrivial task, call `context_for_task` on the `shale`
-MCP server with a one-sentence description of what you're about to do.
-Treat `recency_fallback` packets with low confidence.
+Before starting any nontrivial task, call `context_for_task` on the `shale` MCP
+server with a one-sentence description, the repository, and a stable task key
+when one exists. Treat `recency_fallback` packets with low confidence. Only call
+`remember_explicit` when I directly ask you to remember something; put inferred
+durable knowledge in `propose_memory`. Save a checkpoint at meaningful stopping
+points on work that will continue later.
 ```
+
+## Memories and checkpoints
+
+Memories have three recall scopes: `user` (available everywhere), `repo`, and
+`task`. Scope is inferred from `--task` and `--repo`, or can be stated directly:
+
+```sh
+shale remember "Use pnpm in this repository" --repo nonlinear/shale
+shale remember "Prefer terse status updates" --scope user
+
+shale memories                         # active memories only
+shale proposals                        # pending agent inferences
+shale accept memory:<id>               # optionally: --file edited.md
+shale reject memory:<id>               # rejects and destroys proposal content
+shale supersede memory:<id> "Use bun" # keeps the old exact version addressable
+```
+
+`shale forget <ref>` retracts native state from future recall but retains its
+auditable versions. `shale purge <ref> --yes` is the explicit destructive path:
+it removes every Shale-managed body version, clears the search projection,
+truncates the SQLite WAL, vacuums freed pages, and leaves only a metadata
+tombstone. Non-interactive purge requires `--yes`.
+
+For an external snapshot, remove its canonical file and run `shale refresh`
+first; once retracted, purge can destroy Shale's retained copy and source
+registration. An existing canonical file cannot be purged through Shale because
+the next refresh would truthfully restore it.
+
+Checkpoints are structured handoffs rather than free-form memories: goal,
+current summary, decisions, changed artifacts, open loops, next actions, and
+evidence refs. `context_for_task` returns only the latest checkpoint for an exact
+task key; `shale checkpoints --task <key>` audits the history.
+
+## Runbooks and existing harness memory
+
+Runbooks use a hybrid ownership model:
+
+```sh
+shale runbook create --file personal-release.md   # Shale-native, user scoped
+shale runbook revise runbook:<id> --file new.md
+shale runbook register docs/release.md             # file stays Git-canonical
+shale runbook list
+```
+
+A registered runbook must be inside a Git worktree. Shale snapshots it for local
+retrieval, records revisions when its bytes change, and retracts the snapshot if
+the source disappears; it never edits the file. There is intentionally no
+runbook executor or execution-history model in this release.
+
+`shale refresh` also snapshots existing Codex memory, Claude auto-memory, and
+global/repository instruction files. The original files remain canonical and
+untouched. Indexed instruction files are available through
+`shale search --kind instruction` and `shale show`, but are not duplicated into
+context packets because the harness already loads them. External memories carry
+their harness and `external_generated` authority in provenance rather than being
+presented as user assertions.
+
+Discovery follows the harnesses' documented locations: `$CODEX_HOME/memories`
+(or `~/.codex/memories`), global and repository `AGENTS.override.md` / `AGENTS.md`,
+Claude's configured `autoMemoryDirectory` or
+`~/.claude/projects/<project>/memory/`, and global/repository `CLAUDE.md`,
+`.claude/CLAUDE.md`, `CLAUDE.local.md`, and `.claude/rules/**/*.md`. See the
+[Codex memory documentation](https://learn.chatgpt.com/docs/customization/memories)
+and [Claude Code memory documentation](https://code.claude.com/docs/en/memory)
+for the canonical path semantics.
 
 ## Search, then read
 
@@ -91,9 +177,10 @@ $ shale show chunk:1:0 --full   # the whole session
 $ shale show session:1 --lines 40,90
 ```
 
-`--kind error`, `--repo owner/name` and `--since <days>` narrow a search the same
-way the MCP tools do; the CLI and the MCP server read the same chunk index, so
-they cannot give you different answers to the same question.
+`--kind error`, `--repo owner/name` and `--since <days>` narrow transcript
+search. `--kind memory|checkpoint|runbook|instruction` searches durable state;
+artifact results cite an exact version such as `memory:<id>@<eventSeq>`, while
+the versionless ref follows the current state.
 
 ## Browsing
 
@@ -156,9 +243,10 @@ Tea v2, and does not affect MCP or piped output.
 
 ## What leaves your machine
 
-By default: nothing. The local tier is a SQLite index and a directory of scrubbed
-transcripts under `~/.shale`. There is no account, no daemon phoning home, and no
-LLM call — retrieval is FTS5 keyword search over your own corpus.
+By default: nothing. The local tier is a SQLite index plus content-addressed,
+scrubbed transcript and artifact blobs under `~/.shale`. There is no account, no
+daemon phoning home, and no LLM call — retrieval is FTS5 keyword search over your
+own corpus.
 
 `shale link` is the only command that involves a server, and it is the upgrade
 path, not the product. What it buys is the thing you cannot compute on one
@@ -170,11 +258,12 @@ opt-in.
 
 ## Secrets
 
-Transcripts are scrubbed **before** they are hashed, stored, or uploaded — nine
-named rules (cloud keys, tokens, JWTs, PEM blocks, `SECRET=`-shaped assignments)
-plus a Shannon-entropy catch-all. Redactions are stable: the same secret produces
-the same placeholder everywhere, so you can still see that line 40 and line 900
-referenced one key without the value being recoverable.
+Transcripts, native memories, checkpoints, runbooks, and external snapshots are
+scrubbed **before** they are hashed or stored — nine named rules (cloud keys,
+tokens, JWTs, PEM blocks, `SECRET=`-shaped assignments) plus a Shannon-entropy
+catch-all. Redactions are stable: the same secret produces the same placeholder
+everywhere, so you can still see that two records referenced one key without the
+value being recoverable.
 
 Per-rule counts are recorded so you can audit what was caught. The values never
 are.

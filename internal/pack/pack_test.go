@@ -204,6 +204,135 @@ func TestBudgetIsClamped(t *testing.T) {
 	}
 }
 
+func TestPacketCarriesDurableStateWithScopedVersionedCitations(t *testing.T) {
+	db := seedCorpus(t)
+	ctx := context.Background()
+	put := func(in store.ArtifactInput) store.Artifact {
+		t.Helper()
+		a, _, err := db.PutArtifact(ctx, in)
+		if err != nil {
+			t.Fatalf("put %s: %v", in.Kind, err)
+		}
+		return a
+	}
+
+	checkpoint := put(store.ArtifactInput{
+		Kind: store.ArtifactCheckpoint, ScopeKind: store.ScopeTask,
+		ScopeKey: "release-42", Repo: "acme/app", Title: "Release handoff",
+		Content: store.ArtifactContent{TaskKey: "release-42", Goal: "Ship the signed release", Summary: "Signing is wired; notarization remains."},
+	})
+	memory := put(store.ArtifactInput{
+		Kind: store.ArtifactMemory, ScopeKind: store.ScopeRepo, Repo: "acme/app",
+		Title: "Release signing", Content: store.ArtifactContent{Text: "Release signing uses the Apple Developer identity."},
+	})
+	runbook := put(store.ArtifactInput{
+		Kind: store.ArtifactRunbook, ScopeKind: store.ScopeRepo, Repo: "acme/app",
+		Title: "Release runbook", Content: store.ArtifactContent{Text: "Release runbook: sign, notarize, then publish."},
+	})
+	put(store.ArtifactInput{
+		Kind: store.ArtifactMemory, Status: store.ArtifactPending,
+		ScopeKind: store.ScopeRepo, Repo: "acme/app", Title: "Unapproved release guess",
+		Content: store.ArtifactContent{Text: "Release signing should skip notarization."},
+	})
+	put(store.ArtifactInput{
+		Kind: store.ArtifactMemory, ScopeKind: store.ScopeRepo, Repo: "acme/other",
+		Title: "Other repo release", Content: store.ArtifactContent{Text: "Release signing uses an unrelated certificate."},
+	})
+
+	p, err := Build(ctx, db, Input{
+		Task: "finish release signing and notarization", TaskKey: "release-42",
+		Repo: "acme/app", SinceDays: 90,
+	})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	for name, section := range map[string][]Evidence{
+		"checkpoints": p.Sections.Checkpoints,
+		"memories":    p.Sections.Memories,
+		"runbooks":    p.Sections.Runbooks,
+	} {
+		if len(section) == 0 {
+			t.Fatalf("%s section is empty", name)
+		}
+	}
+	if p.Sections.Checkpoints[0].Ref != checkpoint.VersionedRef() {
+		t.Errorf("checkpoint ref = %q, want %q", p.Sections.Checkpoints[0].Ref, checkpoint.VersionedRef())
+	}
+	if p.Sections.Memories[0].Ref != memory.VersionedRef() {
+		t.Errorf("memory ref = %q, want %q", p.Sections.Memories[0].Ref, memory.VersionedRef())
+	}
+	if p.Sections.Runbooks[0].Ref != runbook.VersionedRef() {
+		t.Errorf("runbook ref = %q, want %q", p.Sections.Runbooks[0].Ref, runbook.VersionedRef())
+	}
+	for _, e := range p.Sections.Memories {
+		if strings.Contains(e.Content, "skip notarization") || strings.Contains(e.Content, "unrelated certificate") {
+			t.Errorf("unapproved or cross-repo memory leaked into packet: %q", e.Content)
+		}
+		if e.Prov.ScopeKind == "" || e.Prov.Status != string(store.ArtifactActive) {
+			t.Errorf("memory provenance is incomplete: %+v", e.Prov)
+		}
+	}
+	total := len(p.Sections.Checkpoints) + len(p.Sections.Memories) + len(p.Sections.Runbooks) +
+		len(p.Sections.Corrections) + len(p.Sections.Evidence)
+	if len(p.Citations) != total {
+		t.Errorf("citations (%d) do not cover every served item (%d)", len(p.Citations), total)
+	}
+	if p.Budget.UsedTokens > p.Budget.MaxTokens {
+		t.Errorf("used %d tokens of a %d budget", p.Budget.UsedTokens, p.Budget.MaxTokens)
+	}
+}
+
+func TestPacketWithoutScopeOnlyRecallsUserArtifacts(t *testing.T) {
+	db := seedCorpus(t)
+	ctx := context.Background()
+	for _, in := range []store.ArtifactInput{
+		{Kind: store.ArtifactMemory, ScopeKind: store.ScopeUser, Title: "Global formatter", Content: store.ArtifactContent{Text: "Use the quartz formatter everywhere."}},
+		{Kind: store.ArtifactMemory, ScopeKind: store.ScopeRepo, Repo: "secret/repo", Title: "Private formatter", Content: store.ArtifactContent{Text: "Use the quartz formatter only in the private repository."}},
+	} {
+		if _, _, err := db.PutArtifact(ctx, in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p, err := Build(ctx, db, Input{Task: "configure the quartz formatter"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Sections.Memories) != 1 || strings.Contains(p.Sections.Memories[0].Content, "private repository") {
+		t.Fatalf("unscoped packet leaked repository state: %+v", p.Sections.Memories)
+	}
+}
+
+func TestLargeCheckpointIsExcerptedRatherThanDropped(t *testing.T) {
+	db := seedCorpus(t)
+	ctx := context.Background()
+	checkpoint, _, err := db.PutArtifact(ctx, store.ArtifactInput{
+		Kind: store.ArtifactCheckpoint, ScopeKind: store.ScopeTask,
+		ScopeKey: "BIG-1", Repo: "acme/app", Title: "Large handoff",
+		Content: store.ArtifactContent{
+			TaskKey: "BIG-1", Goal: "Resume safely",
+			Summary: strings.Repeat("Detailed checkpoint state. ", 1500),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := Build(ctx, db, Input{
+		Task: "resume safely", TaskKey: "BIG-1", Repo: "acme/app", TokenBudget: MinBudget,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Sections.Checkpoints) != 1 || p.Sections.Checkpoints[0].Ref != checkpoint.VersionedRef() {
+		t.Fatalf("large exact checkpoint was dropped: %+v", p.Sections.Checkpoints)
+	}
+	if !strings.Contains(p.Sections.Checkpoints[0].Content, "read the ref for the full artifact") {
+		t.Errorf("large checkpoint was not marked as an excerpt")
+	}
+	if p.Budget.UsedTokens > p.Budget.MaxTokens {
+		t.Fatalf("excerpt exceeded budget: %+v", p.Budget)
+	}
+}
+
 // The estimator must never under-count, or the ceiling it enforces is not a
 // ceiling.
 func TestTokenEstimateOverCounts(t *testing.T) {

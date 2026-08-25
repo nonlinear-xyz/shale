@@ -30,6 +30,27 @@ import (
 // Kind values for events. Open set: a new kind is additive, never a schema change.
 const (
 	KindSessionCaptured = "session.captured"
+
+	KindMemoryProposed   = "memory.proposed"
+	KindMemoryAsserted   = "memory.asserted"
+	KindMemoryAccepted   = "memory.accepted"
+	KindMemorySuperseded = "memory.superseded"
+	KindMemoryRejected   = "memory.rejected"
+	KindMemoryRetracted  = "memory.retracted"
+	KindMemoryPurged     = "memory.purged"
+
+	KindCheckpointSaved = "checkpoint.saved"
+
+	KindRunbookCreated    = "runbook.created"
+	KindRunbookRegistered = "runbook.registered"
+	KindRunbookRevised    = "runbook.revised"
+	KindRunbookRefreshed  = "runbook.refreshed"
+
+	KindExternalIndexed = "external.indexed"
+	KindExternalRemoved = "external.removed"
+
+	KindArtifactRetracted = "artifact.retracted"
+	KindArtifactPurged    = "artifact.purged"
 )
 
 // DB wraps the local store.
@@ -48,7 +69,7 @@ func Open(dir string) (*DB, error) {
 
 	// WAL so a reader (the MCP server) never blocks the writer (the watcher).
 	// busy_timeout so a concurrent sweep waits instead of failing outright.
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=secure_delete(1)"
 	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open %s: %w", path, err)
@@ -59,6 +80,23 @@ func Open(dir string) (*DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+// OpenReadOnly opens an existing store without migrations or filesystem writes.
+// It exists for `watch --dry-run`: even an idempotent migration or WAL setup
+// would violate a preview's promise not to touch persistent state.
+func OpenReadOnly(dir string) (*DB, error) {
+	path := filepath.Join(dir, "shale.db")
+	dsn := "file:" + path + "?mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(5000)"
+	sqlDB, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open %s read-only: %w", path, err)
+	}
+	if err := sqlDB.Ping(); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("cannot open %s read-only: %w", path, err)
+	}
+	return &DB{sql: sqlDB, root: dir}, nil
 }
 
 func (d *DB) Close() error { return d.sql.Close() }
@@ -142,8 +180,34 @@ CREATE TABLE IF NOT EXISTS cursors (
 `
 
 func (d *DB) migrate() error {
-	if _, err := d.sql.Exec(schema); err != nil {
-		return fmt.Errorf("migrate: %w", err)
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return fmt.Errorf("begin migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	// `schema` is the version-zero baseline. It remains idempotent so a database
+	// created by any older shale build can be upgraded without first knowing the
+	// exact build that created it.
+	if _, err := tx.Exec(schema); err != nil {
+		return fmt.Errorf("migrate baseline: %w", err)
+	}
+
+	var version int
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return fmt.Errorf("read schema version: %w", err)
+	}
+	if version < 1 {
+		if _, err := tx.Exec(artifactSchema); err != nil {
+			return fmt.Errorf("migrate artifacts: %w", err)
+		}
+		if _, err := tx.Exec(`PRAGMA user_version = 1`); err != nil {
+			return fmt.Errorf("record schema version: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit migration: %w", err)
 	}
 	return nil
 }
@@ -925,13 +989,19 @@ func (d *DB) SetCursor(ctx context.Context, source string, mtimeMS int64) error 
 
 // Stats summarizes the corpus for `shale status`.
 type Stats struct {
-	Events     int
-	Sessions   int
-	Repos      int
-	Chunks     int
-	OldestAt   string
-	NewestAt   string
-	TotalTurns int
+	Events       int
+	Sessions     int
+	Repos        int
+	Chunks       int
+	Memories     int
+	Proposals    int
+	Checkpoints  int
+	Runbooks     int
+	Instructions int
+	Sources      int
+	OldestAt     string
+	NewestAt     string
+	TotalTurns   int
 }
 
 func (d *DB) Stats(ctx context.Context) (Stats, error) {
@@ -940,11 +1010,19 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 		SELECT
 		  (SELECT count(*) FROM events),
 		  (SELECT count(*) FROM events WHERE kind = ?),
-		  (SELECT count(DISTINCT scope) FROM events WHERE scope IS NOT NULL AND scope != ''),
+		  (SELECT count(DISTINCT scope) FROM events WHERE kind = ? AND scope IS NOT NULL AND scope != ''),
 		  (SELECT count(*) FROM chunks_fts),
+		  (SELECT count(*) FROM artifacts WHERE kind = 'memory' AND status = 'active'),
+		  (SELECT count(*) FROM artifacts WHERE kind = 'memory' AND status = 'pending'),
+		  (SELECT count(*) FROM artifacts WHERE kind = 'checkpoint' AND status = 'active'),
+		  (SELECT count(*) FROM artifacts WHERE kind = 'runbook' AND status = 'active'),
+		  (SELECT count(*) FROM artifacts WHERE kind = 'instruction' AND status = 'active'),
+		  (SELECT count(*) FROM artifact_sources),
 		  (SELECT coalesce(min(occurred_at), '') FROM events),
 		  (SELECT coalesce(max(occurred_at), '') FROM events)`,
-		KindSessionCaptured,
-	).Scan(&s.Events, &s.Sessions, &s.Repos, &s.Chunks, &s.OldestAt, &s.NewestAt)
+		KindSessionCaptured, KindSessionCaptured,
+	).Scan(&s.Events, &s.Sessions, &s.Repos, &s.Chunks, &s.Memories,
+		&s.Proposals, &s.Checkpoints, &s.Runbooks, &s.Instructions, &s.Sources,
+		&s.OldestAt, &s.NewestAt)
 	return s, err
 }

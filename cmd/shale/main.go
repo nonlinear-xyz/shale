@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -43,7 +44,18 @@ Usage:
   shale repos               list git repositories found on this machine (local only)
   shale watch               capture settled agent sessions into the local store
   shale search <query>      search the local corpus
-  shale show <ref>          print the passage or session a ref names
+  shale show <ref>          print the passage, session, or durable artifact a ref names
+  shale remember <text>     save an explicit durable memory
+  shale memories            list approved memories
+  shale proposals           review pending agent memory proposals
+  shale accept <ref>        approve a pending memory proposal
+  shale reject <ref>        reject and destroy a pending proposal
+  shale supersede <ref>     replace an approved memory with a new version
+  shale forget <ref>        retract native state from recall
+  shale purge <ref> --yes   irreversibly destroy every stored body version
+  shale checkpoints         list task handoffs saved by agents
+  shale runbook <command>   create, register, revise, or list runbooks
+  shale refresh             index Claude/Codex memory and instruction files
   shale browse              search, read and audit interactively
   shale status              what has been captured
   shale mcp                 serve context to agents over stdio MCP
@@ -90,6 +102,30 @@ func main() {
 		err = cmdSearch(ctx, args)
 	case "show":
 		err = cmdShow(ctx, args)
+	case "remember":
+		err = cmdRemember(ctx, args)
+	case "memories":
+		err = cmdMemories(ctx, args)
+	case "proposals":
+		err = cmdProposals(ctx, args)
+	case "accept":
+		err = cmdAccept(ctx, args)
+	case "reject":
+		err = cmdReject(ctx, args)
+	case "supersede":
+		err = cmdSupersede(ctx, args)
+	case "forget":
+		err = cmdForget(ctx, args)
+	case "purge":
+		err = cmdPurge(ctx, args)
+	case "checkpoints":
+		err = cmdCheckpoints(ctx, args)
+	case "runbook":
+		err = cmdRunbook(ctx, args)
+	case "runbooks":
+		err = cmdRunbook(ctx, append([]string{"list"}, args...))
+	case "refresh":
+		err = cmdRefresh(ctx, args)
 	case "browse":
 		err = cmdBrowse(ctx, args)
 	case "status":
@@ -186,10 +222,11 @@ func cmdWatch(ctx context.Context, args []string) error {
 		return err
 	}
 
-	db, err := openStore()
+	db, cleanup, err := openWatchStore(*dryRun)
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 	defer db.Close()
 
 	sc, warnings := scrub.New()
@@ -197,16 +234,20 @@ func cmdWatch(ctx context.Context, args []string) error {
 		fmt.Fprintf(os.Stderr, "warning: %v\n", w)
 	}
 
-	machine, err := config.LoadOrCreateMachine()
-	if err != nil {
-		return err
+	machineLabel := "dry-run"
+	if !*dryRun {
+		machine, err := config.LoadOrCreateMachine()
+		if err != nil {
+			return err
+		}
+		machineLabel = machine.Label
 	}
 
 	res, err := watch.Sweep(ctx, db, sc, watch.Options{
 		Sources: srcs,
 		DryRun:  *dryRun,
 		Rescan:  *rescan,
-		Machine: machine.Label,
+		Machine: machineLabel,
 	})
 	if err != nil {
 		return err
@@ -246,6 +287,11 @@ func cmdWatch(ctx context.Context, args []string) error {
 		// non-zero is what makes that visible to a scheduler instead of silent.
 		return fmt.Errorf("%d file%s failed", len(res.Errors), plural(len(res.Errors)))
 	}
+	if !*dryRun {
+		if err := refreshArtifacts(ctx, db, *verbose); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -263,12 +309,13 @@ func cmdSearch(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("search", flag.ExitOnError)
 	limit := fs.Int("limit", 10, "maximum results")
 	repo := fs.String("repo", "", `filter to one repository ("owner/name")`)
-	kind := fs.String("kind", "", `filter to a passage kind ("error" finds only things that failed)`)
+	kind := fs.String("kind", "", `transcript, error, memory, checkpoint, runbook, or instruction`)
+	taskKey := fs.String("task", "", "filter durable state to a task key")
 	sinceDays := fs.Int("since", 0, "only search sessions from the last N days")
 	// Go's flag package stops parsing at the first positional argument, so
 	// `search worktree --limit 3` would put "--limit 3" INTO the query and search
 	// for it. Nobody types flags before a search term, so reorder first.
-	valued := map[string]bool{"limit": true, "repo": true, "kind": true, "since": true}
+	valued := map[string]bool{"limit": true, "repo": true, "kind": true, "task": true, "since": true}
 	if err := fs.Parse(reorderFlagsFirst(args, valued)); err != nil {
 		return err
 	}
@@ -283,7 +330,34 @@ func cmdSearch(ctx context.Context, args []string) error {
 	}
 	defer db.Close()
 
-	hits, err := db.SearchChunks(ctx, query, *repo, *kind, *sinceDays, *limit)
+	kindValue := strings.TrimSpace(*kind)
+	artifactKind := store.ArtifactKind(kindValue)
+	switch artifactKind {
+	case store.ArtifactMemory, store.ArtifactCheckpoint, store.ArtifactRunbook, store.ArtifactInstruction:
+		hits, err := db.SearchArtifacts(ctx, store.ArtifactSearch{
+			Query: query, Kind: artifactKind, Repo: *repo, TaskKey: *taskKey, Limit: *limit,
+		})
+		if err != nil {
+			return err
+		}
+		if len(hits) == 0 {
+			fmt.Printf("No %s matches for %q.\n", artifactKind, query)
+			return nil
+		}
+		render.ArtifactSearchResults(os.Stdout, theme(), query, hits)
+		return nil
+	case "", "transcript", "error":
+	default:
+		return fmt.Errorf("unknown --kind %q (want transcript, error, memory, checkpoint, runbook, or instruction)", *kind)
+	}
+	chunkKind := kindValue
+	if chunkKind == "transcript" {
+		// "transcript" means the ordinary corpus, not an exact chunks_fts
+		// subtype. An empty kind is the store's all-transcript-passages query.
+		chunkKind = ""
+	}
+
+	hits, err := db.SearchChunks(ctx, query, *repo, chunkKind, *sinceDays, *limit)
 	if err != nil {
 		return err
 	}
@@ -324,11 +398,7 @@ func cmdShow(ctx context.Context, args []string) error {
 	}
 	arg := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if arg == "" {
-		return errors.New(`usage: shale show <ref>   (chunk:<seq>:<index>, session:<seq> or <seq>)`)
-	}
-	ref, err := store.ParseRef(arg)
-	if err != nil {
-		return err
+		return errors.New(`usage: shale show <ref>   (artifact, chunk:<seq>:<index>, session:<seq> or <seq>)`)
 	}
 
 	db, err := openStore()
@@ -336,6 +406,21 @@ func cmdShow(ctx context.Context, args []string) error {
 		return err
 	}
 	defer db.Close()
+	if artifactRef, parseErr := store.ParseArtifactRef(arg); parseErr == nil {
+		if *lines != "" {
+			return errors.New("--lines only applies to transcript refs")
+		}
+		a, err := db.ResolveArtifactRef(ctx, artifactRef)
+		if err != nil {
+			return err
+		}
+		render.ArtifactDetail(os.Stdout, theme(), a)
+		return nil
+	}
+	ref, err := store.ParseRef(arg)
+	if err != nil {
+		return err
+	}
 
 	info, err := db.Session(ctx, ref.EventSeq)
 	if err != nil {
@@ -457,6 +542,12 @@ func cmdStatus(ctx context.Context, args []string) error {
 		{"sessions", fmt.Sprint(st.Sessions)},
 		{"repositories", fmt.Sprint(st.Repos)},
 		{"indexed chunks", fmt.Sprint(st.Chunks)},
+		{"active memories", fmt.Sprint(st.Memories)},
+		{"pending proposals", fmt.Sprint(st.Proposals)},
+		{"task checkpoints", fmt.Sprint(st.Checkpoints)},
+		{"active runbooks", fmt.Sprint(st.Runbooks)},
+		{"indexed instructions", fmt.Sprint(st.Instructions)},
+		{"watched sources", fmt.Sprint(st.Sources)},
 	}
 	if st.OldestAt != "" {
 		rows = append(rows, [2]string{"span", st.OldestAt + " → " + st.NewestAt})
@@ -464,7 +555,11 @@ func cmdStatus(ctx context.Context, args []string) error {
 	render.StatusTable(os.Stdout, th, rows)
 
 	if st.Sessions == 0 {
-		fmt.Println("\n" + th.Warn.Render("Nothing captured yet. Run `shale watch`."))
+		message := "No agent sessions captured yet. Run `shale watch`."
+		if st.Memories+st.Proposals+st.Checkpoints+st.Runbooks+st.Instructions == 0 {
+			message = "Nothing captured yet. Run `shale watch` or `shale remember`."
+		}
+		fmt.Println("\n" + th.Warn.Render(message))
 		fmt.Println(th.Hint.Render("Sessions must be idle for 30 minutes before they are swept."))
 	}
 	return nil
@@ -523,6 +618,34 @@ func openStore() (*store.DB, error) {
 		return nil, err
 	}
 	return store.Open(dir)
+}
+
+func openWatchStore(dryRun bool) (*store.DB, func(), error) {
+	if !dryRun {
+		db, err := openStore()
+		return db, func() {}, err
+	}
+	dir, err := config.StateDirPath()
+	if err != nil {
+		return nil, func() {}, err
+	}
+	if _, err := os.Stat(filepath.Join(dir, "shale.db")); err == nil {
+		db, err := store.OpenReadOnly(dir)
+		return db, func() {}, err
+	} else if !os.IsNotExist(err) {
+		return nil, func() {}, err
+	}
+	tmp, err := os.MkdirTemp("", "shale-dry-run-")
+	if err != nil {
+		return nil, func() {}, err
+	}
+	cleanup := func() { _ = os.RemoveAll(tmp) }
+	db, err := store.Open(tmp)
+	if err != nil {
+		cleanup()
+		return nil, func() {}, err
+	}
+	return db, cleanup, nil
 }
 
 func parseSources(flagValue string) ([]sessions.Source, error) {
