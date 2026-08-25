@@ -145,6 +145,22 @@ func (c ArtifactContent) SearchText() string {
 	return strings.TrimSpace(strings.Join(nonEmpty(parts), "\n"))
 }
 
+// primaryText is the field a derived title should be taken from: the kind's main
+// display content. Deriving from SearchText() instead would title a task-scoped
+// or triggered memory with its retrieval hints (taskKey, trigger) rather than its
+// text, which contradicts the MCP contract that memory titles come from `text`.
+func (c ArtifactContent) primaryText(kind ArtifactKind) string {
+	if kind == ArtifactCheckpoint {
+		for _, v := range []string{c.Goal, c.Summary, c.Text} {
+			if strings.TrimSpace(v) != "" {
+				return v
+			}
+		}
+		return ""
+	}
+	return c.Text
+}
+
 // RenderText gives checkpoints a readable handoff shape while leaving Markdown
 // memories, instructions and runbooks untouched.
 func (c ArtifactContent) RenderText(kind ArtifactKind) string {
@@ -300,7 +316,7 @@ func (d *DB) PutArtifact(ctx context.Context, in ArtifactInput) (Artifact, bool,
 	// are not recoverable from the body — are still stored. The mutable projection
 	// and FTS keep the real title so live reads and context packing are unchanged.
 	eventTitle := in.Title
-	if in.Title == deriveTitle(in.Content.SearchText()) {
+	if in.Title == deriveTitle(in.Content.primaryText(in.Kind)) {
 		eventTitle = ""
 	}
 	payload := artifactEventPayload{
@@ -439,7 +455,7 @@ func normalizeArtifactInput(in ArtifactInput) ArtifactInput {
 		in.Actor = "human"
 	}
 	if strings.TrimSpace(in.Title) == "" {
-		in.Title = deriveTitle(in.Content.SearchText())
+		in.Title = deriveTitle(in.Content.primaryText(in.Kind))
 	}
 	if in.EventKind == "" {
 		in.EventKind = defaultArtifactEventKind(in)
@@ -644,7 +660,7 @@ func (d *DB) ArtifactAt(ctx context.Context, id string, eventSeq int64) (Artifac
 	// re-derive it now that the version body is loaded. Purged versions keep an
 	// empty title because their body is gone — nothing to reveal.
 	if a.Title == "" {
-		a.Title = deriveTitle(a.Content.SearchText())
+		a.Title = deriveTitle(a.Content.primaryText(a.Kind))
 	}
 	return a, nil
 }

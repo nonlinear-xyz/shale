@@ -525,7 +525,11 @@ func (s *Server) saveCheckpoint(ctx context.Context, raw json.RawMessage) (any, 
 		if prior.Content.TaskKey != strings.TrimSpace(args.TaskKey) {
 			return toolError("previousCheckpoint belongs to a different task"), nil
 		}
-		if args.Repo != "" && prior.Repo != "" && prior.Repo != strings.TrimSpace(args.Repo) {
+		// Compare normalized repositories directly, including empty values. Skipping
+		// the check when either side is empty would let an unscoped checkpoint chain
+		// to a repo-scoped one (or vice versa), crossing the repository boundary and
+		// exposing an unrelated handoff through read_ref.
+		if prior.Repo != strings.TrimSpace(args.Repo) {
 			return toolError("previousCheckpoint belongs to a different repository"), nil
 		}
 		previous = prior.VersionedRef()

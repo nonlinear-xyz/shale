@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/nonlinear-xyz/shale/internal/store"
 )
 
 func TestNativeMemoryCLIWorkflow(t *testing.T) {
@@ -81,6 +84,31 @@ func TestNativeMemoryCLIWorkflow(t *testing.T) {
 	afterPurge, _ := run(true, "show", oldVersion)
 	if !strings.Contains(afterPurge, "content is unavailable or has been purged") {
 		t.Fatalf("purged historical body remained readable:\n%s", afterPurge)
+	}
+}
+
+func TestSupersedeRequiresNativeOwnership(t *testing.T) {
+	db, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	// An auto-indexed, non-native memory (e.g. discovered from a Claude file).
+	a, _, err := db.PutArtifact(ctx, store.ArtifactInput{
+		Kind: store.ArtifactMemory, ScopeKind: store.ScopeUser,
+		Origin: "claude", Source: "claude", SourcePointer: "~/.claude/CLAUDE.md",
+		Content: store.ArtifactContent{Text: "Imported guidance."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// supersede routes through requireNativeArtifact, which must refuse it so a
+	// refresh cannot resurrect the file content over an invalid human revision.
+	if _, err := requireNativeArtifact(ctx, db, store.ArtifactRef{Kind: store.ArtifactMemory, ID: a.ID}); err == nil {
+		t.Fatal("supersede gate allowed a non-native memory")
+	} else if !strings.Contains(err.Error(), "managed by") {
+		t.Fatalf("unexpected gate error: %v", err)
 	}
 }
 

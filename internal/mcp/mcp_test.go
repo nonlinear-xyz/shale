@@ -231,6 +231,24 @@ func TestCheckpointsChainAndLatestTaskCheckpointIsServed(t *testing.T) {
 	}
 }
 
+func TestCheckpointChainCannotCrossRepositories(t *testing.T) {
+	s := newServer(t)
+	first := run(t, s,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"save_checkpoint","arguments":{"taskKey":"REL-42","repo":"acme/private","goal":"Private handoff","summary":"secret state"}}}`,
+	)
+	ref := toolPayload(t, first[0])["versionedRef"].(string)
+
+	// Chaining an unscoped checkpoint onto a repo-scoped prior must be rejected:
+	// an empty repo previously skipped the check and crossed the boundary.
+	crossed := run(t, s, fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"save_checkpoint","arguments":{"taskKey":"REL-42","goal":"Public handoff","summary":"public state","previousCheckpoint":%q}}}`, ref,
+	))
+	payload := toolPayload(t, crossed[0])
+	if errText, _ := payload["error"].(string); !strings.Contains(errText, "different repository") {
+		t.Fatalf("cross-repo checkpoint chain was not rejected: %v", payload)
+	}
+}
+
 func TestMutationValidationErrorsAreToolContent(t *testing.T) {
 	s := newServer(t)
 	got := run(t, s,

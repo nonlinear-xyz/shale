@@ -219,7 +219,12 @@ func cmdSupersede(ctx context.Context, args []string) error {
 		return err
 	}
 	defer db.Close()
-	current, err := db.Artifact(ctx, ref.ID)
+	// Superseding rewrites the body and appends an immutable revision, so it must
+	// be gated by native ownership like the other lifecycle commands. Without this,
+	// an auto-indexed Claude/Codex memory could be overwritten with human content
+	// while keeping its external origin; the next `shale refresh` would restore the
+	// file content and leave the invalid intermediate revision in the history.
+	current, err := requireNativeArtifact(ctx, db, ref)
 	if err != nil {
 		return err
 	}

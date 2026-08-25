@@ -366,6 +366,51 @@ func TestDerivedTitleResolvesFromVersionedRef(t *testing.T) {
 	}
 }
 
+func TestDerivedTitleUsesDisplayContent(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	// A triggered memory: SearchText() would surface the trigger first, but the
+	// title must come from the text per the MCP memory contract.
+	mem, _, err := db.PutArtifact(ctx, ArtifactInput{
+		Kind: ArtifactMemory, ScopeKind: ScopeUser,
+		Content: ArtifactContent{
+			Trigger: "when deploying to prod",
+			Text:    "Always run the migration dry-run first.",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mem.Title != "Always run the migration dry-run first." {
+		t.Fatalf("memory title should derive from text, got %q", mem.Title)
+	}
+
+	// A task-scoped memory: the title must not become the task key.
+	taskMem, _, err := db.PutArtifact(ctx, ArtifactInput{
+		Kind: ArtifactMemory, ScopeKind: ScopeTask, ScopeKey: "REL-42",
+		Content: ArtifactContent{Text: "Cut the release from the violet lane."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taskMem.Title != "Cut the release from the violet lane." {
+		t.Fatalf("task memory title should derive from text, got %q", taskMem.Title)
+	}
+
+	// A checkpoint has no free text; its title comes from its primary field (goal).
+	ckpt, _, err := db.PutArtifact(ctx, ArtifactInput{
+		Kind: ArtifactCheckpoint, ScopeKind: ScopeTask, ScopeKey: "REL-42",
+		Content: ArtifactContent{Goal: "Ship the violet release", Summary: "Staged and reviewed."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ckpt.Title != "Ship the violet release" {
+		t.Fatalf("checkpoint title should derive from goal, got %q", ckpt.Title)
+	}
+}
+
 func TestTaskScopeWithoutRepoIsIsolated(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
