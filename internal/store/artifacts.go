@@ -292,10 +292,21 @@ func (d *DB) PutArtifact(ctx context.Context, in ArtifactInput) (Artifact, bool,
 		stamp = time.Now().UTC()
 	}
 	stampText := stamp.UTC().Format(time.RFC3339Nano)
+	// A title auto-derived from the body must not enter the append-only event log:
+	// events are immutable, so a later purge could never remove that copy of the
+	// content. deriveTitle is a pure function of the body, so an empty event title
+	// is losslessly re-derived on read (ArtifactAt) while the body survives, and
+	// correctly disappears once the body is purged. Explicit user titles — which
+	// are not recoverable from the body — are still stored. The mutable projection
+	// and FTS keep the real title so live reads and context packing are unchanged.
+	eventTitle := in.Title
+	if in.Title == deriveTitle(in.Content.SearchText()) {
+		eventTitle = ""
+	}
 	payload := artifactEventPayload{
 		ArtifactID: in.ID, Kind: in.Kind, Status: in.Status,
 		ScopeKind: in.ScopeKind, ScopeKey: in.ScopeKey, Repo: in.Repo,
-		Title: in.Title, Origin: in.Origin, Authority: in.Authority,
+		Title: eventTitle, Origin: in.Origin, Authority: in.Authority,
 		Source: in.Source, SourcePointer: in.SourcePointer,
 		EvidenceRefs: append([]string(nil), in.Content.EvidenceRefs...),
 		Redactions:   sc.Counts(),
@@ -629,6 +640,12 @@ func (d *DB) ArtifactAt(ctx context.Context, id string, eventSeq int64) (Artifac
 		return a, err
 	}
 	a.Content, a.ContentPresent = content, true
+	// An empty stored title means it was derived from the body (see PutArtifact);
+	// re-derive it now that the version body is loaded. Purged versions keep an
+	// empty title because their body is gone — nothing to reveal.
+	if a.Title == "" {
+		a.Title = deriveTitle(a.Content.SearchText())
+	}
 	return a, nil
 }
 
@@ -802,8 +819,10 @@ func (d *DB) SearchArtifacts(ctx context.Context, in ArtifactSearch) ([]Artifact
 	if in.UserOnly {
 		query += ` AND scope_kind = 'user'`
 	} else if in.TaskKey != "" {
-		query += ` AND ((scope_kind = 'task' AND scope_key = ? AND (? = '' OR repo = ?)) OR (scope_kind = 'repo' AND repo = ?) OR scope_kind = 'user')`
-		args = append(args, in.TaskKey, in.Repo, in.Repo, in.Repo)
+		// repo is NOT NULL DEFAULT '', so an empty in.Repo must match only
+		// task artifacts with no repo association — never every repository.
+		query += ` AND ((scope_kind = 'task' AND scope_key = ? AND repo = ?) OR (scope_kind = 'repo' AND repo = ?) OR scope_kind = 'user')`
+		args = append(args, in.TaskKey, in.Repo, in.Repo)
 	} else if in.Repo != "" {
 		if in.Recall {
 			query += ` AND ((scope_kind = 'repo' AND repo = ?) OR scope_kind = 'user')`
@@ -857,9 +876,9 @@ func (d *DB) LatestCheckpoint(ctx context.Context, repo, taskKey string) (Artifa
 	err := d.sql.QueryRowContext(ctx, `
 		SELECT id FROM artifacts
 		WHERE kind = ? AND status = ? AND scope_kind = ? AND scope_key = ?
-		  AND (? = '' OR repo = ?)
+		  AND repo = ?
 		ORDER BY updated_at DESC LIMIT 1`,
-		ArtifactCheckpoint, ArtifactActive, ScopeTask, taskKey, repo, repo).Scan(&id)
+		ArtifactCheckpoint, ArtifactActive, ScopeTask, taskKey, repo).Scan(&id)
 	if err == sql.ErrNoRows {
 		return Artifact{}, ErrArtifactNotFound
 	}
@@ -961,10 +980,15 @@ func (d *DB) transitionArtifact(ctx context.Context, id string, status ArtifactS
 		actor = "human"
 	}
 	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	// Status-transition events are tombstones: never persist a title into the
+	// append-only log here. A derived title copies body content, and events are
+	// immutable (events_no_update / events_no_delete), so a title written now
+	// could never be scrubbed by a later purge. Titles are re-derived on read
+	// (ArtifactAt) from the version body when it is still present.
 	p := artifactEventPayload{
 		ArtifactID: a.ID, Kind: a.Kind, Status: status,
 		ScopeKind: a.ScopeKind, ScopeKey: a.ScopeKey, Repo: a.Repo,
-		Title: a.Title, Origin: a.Origin, Authority: a.Authority,
+		Title: "", Origin: a.Origin, Authority: a.Authority,
 		Source: a.Source, SourcePointer: a.SourcePointer,
 		PreviousVersion: a.EventSeq,
 	}
@@ -995,12 +1019,14 @@ func (d *DB) transitionArtifact(ctx context.Context, id string, status ArtifactS
 		return Artifact{}, err
 	}
 	contentHash := any(a.ContentHash)
+	projectedTitle := a.Title
 	if purgeBody {
 		contentHash = nil
+		projectedTitle = purgedTitle
 	}
 	_, err = tx.ExecContext(ctx, `
-		UPDATE artifacts SET status = ?, current_event_seq = ?, content_hash = ?, updated_at = ?
-		WHERE id = ?`, status, seq, contentHash, stamp, id)
+		UPDATE artifacts SET status = ?, current_event_seq = ?, content_hash = ?, title = ?, updated_at = ?
+		WHERE id = ?`, status, seq, contentHash, projectedTitle, stamp, id)
 	if err != nil {
 		return Artifact{}, err
 	}
@@ -1026,6 +1052,7 @@ func (d *DB) transitionArtifact(ctx context.Context, id string, status ArtifactS
 	a.Status, a.EventSeq, a.UpdatedAt = status, seq, stamp
 	if purgeBody {
 		a.ContentHash, a.Content, a.ContentPresent = "", ArtifactContent{}, false
+		a.Title = purgedTitle
 		if err := d.removeUnreferencedArtifactBlobs(ctx, hashes); err != nil {
 			return a, err
 		}
@@ -1220,6 +1247,11 @@ func validArtifactID(id string) bool {
 	}
 	return true
 }
+
+// purgedTitle replaces the title in the projection once an artifact's body has
+// been destroyed, so listings and the tombstone show a marker rather than any
+// text that may have been derived from the purged content.
+const purgedTitle = "(purged)"
 
 func deriveTitle(body string) string {
 	line := strings.TrimSpace(strings.SplitN(body, "\n", 2)[0])

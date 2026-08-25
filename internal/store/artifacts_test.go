@@ -294,3 +294,123 @@ func TestPurgeMakesRefsUnreadableWhenAnotherArtifactSharesTheBlob(t *testing.T) 
 		t.Fatalf("purge broke the artifact that still owns the blob: %+v err=%v", remaining, err)
 	}
 }
+
+func TestPurgeScrubsDerivedTitle(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	// With no explicit title, deriveTitle copies the body's first line into the
+	// title, so purging must also destroy that copy.
+	const secret = "acme-master-password-hunter2"
+	a, _, err := db.PutArtifact(ctx, ArtifactInput{
+		Kind: ArtifactMemory, ScopeKind: ScopeUser,
+		Content: ArtifactContent{Text: secret},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Title != secret {
+		t.Fatalf("precondition: expected derived title %q, got %q", secret, a.Title)
+	}
+	if _, err := db.PurgeArtifact(ctx, a.ID, "human"); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	current, err := db.Artifact(ctx, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(current.Title, secret) {
+		t.Fatalf("purged projection still exposes the derived title: %q", current.Title)
+	}
+	// The append-only event log must not retain the derived title either.
+	rows, err := db.sql.QueryContext(ctx, `SELECT payload FROM events`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(payload, secret) {
+			t.Fatalf("purged content survived in an event payload: %s", payload)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDerivedTitleResolvesFromVersionedRef(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	// No explicit title, so the title is derived from the body and is NOT stored
+	// in the event payload; resolving the version must re-derive it from the body.
+	a, _, err := db.PutArtifact(ctx, ArtifactInput{
+		Kind: ArtifactMemory, ScopeKind: ScopeUser,
+		Content: ArtifactContent{Text: "Prefer trunk-based development here."},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := ParseArtifactRef(a.VersionedRef())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.ResolveArtifactRef(ctx, ref)
+	if err != nil {
+		t.Fatalf("resolve versioned ref: %v", err)
+	}
+	if got.Title != "Prefer trunk-based development here." {
+		t.Fatalf("derived title not re-derived on versioned read: %q", got.Title)
+	}
+}
+
+func TestTaskScopeWithoutRepoIsIsolated(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	for _, in := range []ArtifactInput{
+		{ID: "task-repo-a", Kind: ArtifactMemory, ScopeKind: ScopeTask, ScopeKey: "release", Repo: "acme/a", Content: ArtifactContent{Text: "Ship the violet canary from repo A."}},
+		{ID: "task-repo-b", Kind: ArtifactMemory, ScopeKind: ScopeTask, ScopeKey: "release", Repo: "acme/b", Content: ArtifactContent{Text: "Ship the violet canary from repo B."}},
+		{ID: "task-no-repo", Kind: ArtifactMemory, ScopeKind: ScopeTask, ScopeKey: "release", Content: ArtifactContent{Text: "Ship the violet canary with no repo."}},
+	} {
+		if _, _, err := db.PutArtifact(ctx, in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A task key with no repo must recall only task artifacts that have no repo
+	// association — not every repository that shares the key.
+	hits, err := db.SearchArtifacts(ctx, ArtifactSearch{Query: "violet canary", TaskKey: "release"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].ID != "task-no-repo" {
+		t.Fatalf("empty repo must isolate to no-repo task artifacts: %+v", hits)
+	}
+}
+
+func TestLatestCheckpointWithoutRepoIsIsolated(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	for _, in := range []ArtifactInput{
+		{ID: "ckpt-a", Kind: ArtifactCheckpoint, ScopeKind: ScopeTask, ScopeKey: "REL-42", Repo: "acme/a", Content: ArtifactContent{Text: "checkpoint in repo A"}},
+		{ID: "ckpt-b", Kind: ArtifactCheckpoint, ScopeKind: ScopeTask, ScopeKey: "REL-42", Repo: "acme/b", Content: ArtifactContent{Text: "checkpoint in repo B"}},
+		{ID: "ckpt-none", Kind: ArtifactCheckpoint, ScopeKind: ScopeTask, ScopeKey: "REL-42", Content: ArtifactContent{Text: "checkpoint with no repo"}},
+	} {
+		if _, _, err := db.PutArtifact(ctx, in); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := db.LatestCheckpoint(ctx, "", "REL-42")
+	if err != nil {
+		t.Fatalf("latest checkpoint: %v", err)
+	}
+	if got.ID != "ckpt-none" {
+		t.Fatalf("empty repo must isolate to the no-repo checkpoint, got %q", got.ID)
+	}
+	// Supplying a repo still scopes precisely to that repository.
+	got, err = db.LatestCheckpoint(ctx, "acme/b", "REL-42")
+	if err != nil || got.ID != "ckpt-b" {
+		t.Fatalf("repo-scoped checkpoint = %q err=%v", got.ID, err)
+	}
+}
