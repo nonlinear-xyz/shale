@@ -11,7 +11,7 @@ import (
 
 // seedCorpus builds a store with known content so retrieval behaviour can be
 // asserted rather than eyeballed.
-func seedCorpus(t *testing.T) *store.DB {
+func seedCorpus(t testing.TB) *store.DB {
 	t.Helper()
 	db, err := store.Open(t.TempDir())
 	if err != nil {
@@ -364,6 +364,18 @@ func TestDistillQueryKeepsIdentifiersAndDropsGrammar(t *testing.T) {
 		if len(terms[i]) > len(terms[i-1]) {
 			t.Errorf("terms not sorted longest-first: %v", terms)
 			break
+		}
+	}
+}
+
+func BenchmarkRetrieve(b *testing.B) {
+	db := seedCorpus(b)
+	in := Input{Task: "goreleaser signing darwin release", Repo: "acme/app", SinceDays: 90}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := Retrieve(context.Background(), db, in); err != nil {
+			b.Fatal(err)
 		}
 	}
 }

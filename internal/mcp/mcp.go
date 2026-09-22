@@ -37,8 +37,9 @@ const maxFrameBytes = 1 << 20
 // design: direct writes are only for an explicit user request, while inferred
 // knowledge can only enter the pending proposal queue.
 type Server struct {
-	DB  *store.DB
-	Log io.Writer // stderr; never stdout
+	DB       *store.DB
+	Log      io.Writer // stderr; never stdout
+	Reranker pack.Reranker
 }
 
 type request struct {
@@ -331,6 +332,7 @@ func (s *Server) contextForTask(ctx context.Context, raw json.RawMessage) (any, 
 		Repo:        strings.TrimSpace(args.Repo),
 		SinceDays:   args.SinceDays,
 		TokenBudget: args.MaxTokens,
+		Reranker:    s.Reranker,
 	})
 	if err != nil {
 		s.logf("context_for_task: %v", err)

@@ -82,12 +82,13 @@ type Provenance struct {
 
 // Evidence is one retrieved passage.
 type Evidence struct {
-	Ref      string     `json:"ref"`
-	Title    string     `json:"title"`
-	Content  string     `json:"content"`
-	Score    float64    `json:"score"`
-	Adjacent bool       `json:"adjacent,omitempty"`
-	Prov     Provenance `json:"provenance"`
+	Ref       string     `json:"ref"`
+	Title     string     `json:"title"`
+	Content   string     `json:"content"`
+	Score     float64    `json:"score"`
+	Relevance *Relevance `json:"relevance,omitempty"`
+	Adjacent  bool       `json:"adjacent,omitempty"`
+	Prov      Provenance `json:"provenance"`
 }
 
 // Truncation records a section that did not fit.
@@ -127,7 +128,8 @@ type Packet struct {
 		Corrections []Evidence `json:"corrections"`
 		Evidence    []Evidence `json:"evidence"`
 	} `json:"sections"`
-	Citations []string `json:"citations"`
+	Citations []string       `json:"citations"`
+	Reranking *RankingReport `json:"reranking,omitempty"`
 }
 
 // Input parameterizes packet assembly.
@@ -138,10 +140,21 @@ type Input struct {
 	SinceDays   int
 	TokenBudget int
 	Now         time.Time
+	Reranker    Reranker
 }
 
 // Build assembles a packet from the local store.
 func Build(ctx context.Context, db *store.DB, in Input) (*Packet, error) {
+	c, err := Retrieve(ctx, db, in)
+	if err != nil {
+		return nil, err
+	}
+	return Assemble(ctx, c, in.Reranker)
+}
+
+// Retrieve freezes the eligible candidates before budget packing. It makes no model calls.
+func Retrieve(ctx context.Context, db *store.DB, in Input) (*Candidates, error) {
+	started := time.Now()
 	now := in.Now
 	if now.IsZero() {
 		now = time.Now()
@@ -173,9 +186,6 @@ func Build(ctx context.Context, db *store.DB, in Input) (*Packet, error) {
 	p.Sections.Corrections = []Evidence{}
 	p.Sections.Evidence = []Evidence{}
 
-	fill := int(float64(budget) * fillRatio)
-	served := map[string]bool{}
-
 	terms := DistillQuery(in.Task, 8)
 	query := strings.Join(terms, " AND ")
 	looseQuery := strings.Join(terms, " OR ")
@@ -195,20 +205,6 @@ func Build(ctx context.Context, db *store.DB, in Input) (*Packet, error) {
 	p.SectionRetrieval["checkpoints"] = checkpointRetrieval
 	p.SectionRetrieval["memories"] = memoryRetrieval
 	p.SectionRetrieval["runbooks"] = runbookRetrieval
-
-	// Each section gets a floor, then hands unused space to the next. By the time
-	// evidence fills, every byte not needed by durable state is available to raw
-	// transcript passages.
-	carry := 0
-	p.Sections.Checkpoints, p.Budget.Truncated = fillArtifactSection(
-		"checkpoints", checkpointHits, int(float64(fill)*shareCheckpoints)+carry, now, served, p.Budget.Truncated)
-	carry = int(float64(fill)*shareCheckpoints) + carry - sumTokens(p.Sections.Checkpoints)
-	p.Sections.Memories, p.Budget.Truncated = fillArtifactSection(
-		"memories", memoryHits, int(float64(fill)*shareMemories)+carry, now, served, p.Budget.Truncated)
-	carry = int(float64(fill)*shareMemories) + carry - sumTokens(p.Sections.Memories)
-	p.Sections.Runbooks, p.Budget.Truncated = fillArtifactSection(
-		"runbooks", runbookHits, int(float64(fill)*shareRunbooks)+carry, now, served, p.Budget.Truncated)
-	carry = int(float64(fill)*shareRunbooks) + carry - sumTokens(p.Sections.Runbooks)
 
 	var hits, corrections []store.ChunkHit
 	if len(terms) == 0 {
@@ -253,26 +249,22 @@ func Build(ctx context.Context, db *store.DB, in Input) (*Packet, error) {
 		}
 	}
 
-	correctionCap := int(float64(fill)*shareCorrections) + carry
-	p.Sections.Corrections, p.Budget.Truncated = fillSection(
-		"corrections", corrections, correctionCap, now, served, p.Budget.Truncated)
-	carry = correctionCap - sumTokens(p.Sections.Corrections)
-
-	evidenceCap := int(float64(fill)*shareEvidence) + carry
-	p.Sections.Evidence, p.Budget.Truncated = fillSection(
-		"evidence", hits, evidenceCap, now, served, p.Budget.Truncated)
-
-	all := [][]Evidence{
-		p.Sections.Checkpoints, p.Sections.Memories, p.Sections.Runbooks,
-		p.Sections.Corrections, p.Sections.Evidence,
+	for _, h := range checkpointHits {
+		p.Sections.Checkpoints = append(p.Sections.Checkpoints, artifactEvidence(h, now))
 	}
-	for _, section := range all {
-		for _, e := range section {
-			p.Citations = append(p.Citations, e.Ref)
-		}
-		p.Budget.UsedTokens += sumTokens(section)
+	for _, h := range memoryHits {
+		p.Sections.Memories = append(p.Sections.Memories, artifactEvidence(h, now))
 	}
-	return p, nil
+	for _, h := range runbookHits {
+		p.Sections.Runbooks = append(p.Sections.Runbooks, artifactEvidence(h, now))
+	}
+	for _, h := range corrections {
+		p.Sections.Corrections = append(p.Sections.Corrections, toEvidence(h, now))
+	}
+	for _, h := range hits {
+		p.Sections.Evidence = append(p.Sections.Evidence, toEvidence(h, now))
+	}
+	return &Candidates{Packet: *p, RetrievalMS: float64(time.Since(started).Microseconds()) / 1000}, nil
 }
 
 func artifactHits(ctx context.Context, db *store.DB, in Input, kind store.ArtifactKind, strict, loose string, limit int) ([]store.ArtifactHit, string, error) {
@@ -316,35 +308,6 @@ func artifactHits(ctx context.Context, db *store.DB, in Input, kind store.Artifa
 	return hits, retrieval, nil
 }
 
-func fillArtifactSection(name string, hits []store.ArtifactHit, cap int, now time.Time, served map[string]bool, trunc []Truncation) ([]Evidence, []Truncation) {
-	out := []Evidence{}
-	used, dropped, excerpted := 0, 0, 0
-	for _, hit := range hits {
-		e := artifactEvidence(hit, now)
-		if served[e.Ref] {
-			continue
-		}
-		var shortened bool
-		var fits bool
-		e, shortened, fits = fitArtifactEvidence(e, cap-used)
-		if !fits {
-			dropped++
-			continue
-		}
-		if shortened {
-			excerpted++
-		}
-		cost := EstimateTokens(e.Content) + EstimateTokens(e.Title) + 16
-		served[e.Ref] = true
-		out = append(out, e)
-		used += cost
-	}
-	if dropped > 0 || excerpted > 0 {
-		trunc = append(trunc, Truncation{Section: name, Included: len(out), Dropped: dropped, Excerpted: excerpted})
-	}
-	return out, trunc
-}
-
 func fitArtifactEvidence(e Evidence, remaining int) (Evidence, bool, bool) {
 	overhead := EstimateTokens(e.Title) + 16
 	contentBudget := remaining - overhead
@@ -385,38 +348,6 @@ func artifactEvidence(hit store.ArtifactHit, now time.Time) Evidence {
 			Origin: hit.Origin, Status: string(hit.Status),
 		},
 	}
-}
-
-// fillSection packs hits into a token cap, recording what was dropped.
-//
-// Whole chunks only — a bisected chunk retrieves badly and reads worse, and the
-// point of chunking was to produce windows that stand on their own. Anything that
-// does not fit is reported rather than silently omitted.
-func fillSection(name string, hits []store.ChunkHit, cap int, now time.Time, served map[string]bool, trunc []Truncation) ([]Evidence, []Truncation) {
-	out := []Evidence{}
-	used, dropped := 0, 0
-
-	for _, h := range hits {
-		ref := h.Ref()
-		// A chunk served as a correction is never repeated as evidence.
-		if served[ref] {
-			continue
-		}
-		e := toEvidence(h, now)
-		cost := EstimateTokens(e.Content) + EstimateTokens(e.Title) + 16
-		if used+cost > cap {
-			dropped++
-			continue
-		}
-		served[ref] = true
-		out = append(out, e)
-		used += cost
-	}
-
-	if dropped > 0 {
-		trunc = append(trunc, Truncation{Section: name, Included: len(out), Dropped: dropped})
-	}
-	return out, trunc
 }
 
 func toEvidence(h store.ChunkHit, now time.Time) Evidence {
