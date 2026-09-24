@@ -23,7 +23,7 @@ section{margin:40px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/
 label{display:inline-block;margin:8px 16px 8px 0}select,button{font:inherit;padding:6px 10px}button{cursor:pointer}blockquote{border-left:3px solid #ccc;padding-left:12px;margin:12px 0}.muted{color:#62666c}.bar{position:sticky;top:0;background:#fafafa;padding:12px 0;border-bottom:1px solid #ddd}textarea{width:100%;min-height:65px;font:inherit;box-sizing:border-box}
 </style>
 <h1>Review the tuning labels</h1>
-<p>These are authored diagnostic tasks over real memory snapshots, not historical requests. Labels are assistant drafts made before Jev scoring. Review the task, each label, and the supporting evidence; full candidate text is expandable. An omitted required fact matters more than keyword overlap.</p>
+<p>Review each task and its source context before treating the labels as ground truth. Existing labels are drafts until you review them; unlabelled candidates need a classification. The mode below each task distinguishes real conversation cases from authored memory probes. Full candidate text is expandable.</p>
 <p>No model scores or ordering are shown. This file runs offline. It does not send data anywhere or change the original suite.</p>
 <div class="bar"><button id="download">Download reviewed suite</button> <span id="status"></span></div>
 <div id="cases"></div>
