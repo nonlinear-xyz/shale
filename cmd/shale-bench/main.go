@@ -32,7 +32,7 @@ func main() {
 }
 func run() error {
 	if len(os.Args) < 2 {
-		return errors.New("usage: shale-bench prepare|inspect|run|batch [flags]")
+		return errors.New("usage: shale-bench prepare|inspect|run|compare|batch [flags]")
 	}
 	switch os.Args[1] {
 	case "inspect":
@@ -41,6 +41,8 @@ func run() error {
 		return prepare(os.Args[2:])
 	case "run":
 		return evaluate(os.Args[2:])
+	case "compare":
+		return compare(os.Args[2:])
 	case "batch":
 		return batching(os.Args[2:])
 	default:

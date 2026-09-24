@@ -68,6 +68,16 @@ func RankingCandidates(c *Candidates) []Evidence {
 // Assemble applies optional relevance ordering, then the original section budgets.
 // It never mutates the frozen candidates, including on partial provider failure.
 func Assemble(ctx context.Context, c *Candidates, ranker Reranker) (*Packet, error) {
+	return assemble(ctx, c, ranker, .6)
+}
+
+// AssembleUngated is an evaluation-only policy. Production callers use Assemble.
+// It bypasses the confidence veto, never validation, scope, or budget checks.
+func AssembleUngated(ctx context.Context, c *Candidates, ranker Reranker) (*Packet, error) {
+	return assemble(ctx, c, ranker, 0)
+}
+
+func assemble(ctx context.Context, c *Candidates, ranker Reranker, minimumConfidence float64) (*Packet, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -118,7 +128,7 @@ func Assemble(ctx context.Context, c *Candidates, ranker Reranker) (*Packet, err
 					for j := range *section {
 						v := scores[(*section)[j].Ref]
 						(*section)[j].Relevance = &v
-						if v.Confidence < .6 {
+						if v.Confidence < minimumConfidence {
 							confident = false
 						}
 					}

@@ -153,3 +153,34 @@ func TestRerankerOnlySeesEligibleArtifacts(t *testing.T) {
 		t.Fatal("ranker not invoked")
 	}
 }
+
+func TestUngatedRetainsValidationAndLeavesProductionGated(t *testing.T) {
+	c := candidatesFixture()
+	for _, invalid := range []bool{false, true} {
+		rank := rankFunc(func(_ context.Context, _ string, es []Evidence) (map[string]Relevance, RankingReport, error) {
+			m := map[string]Relevance{}
+			for _, e := range es {
+				m[e.Ref] = Relevance{1, .1}
+			}
+			m["memory:fix"] = Relevance{3, .1}
+			if invalid {
+				m["memory:fix"] = Relevance{99, .1}
+			}
+			return m, RankingReport{}, nil
+		})
+		normal, _ := Assemble(context.Background(), c, rank)
+		ungated, _ := AssembleUngated(context.Background(), c, rank)
+		if normal.Reranking.Status != "fallback" {
+			t.Fatal("production gating changed")
+		}
+		if invalid {
+			if ungated.Reranking.Status != "fallback" {
+				t.Fatal("invalid score applied")
+			}
+		} else {
+			if ungated.Sections.Memories[0].Ref != "memory:fix" || ungated.Sections.Memories[0].Relevance.Confidence != .1 {
+				t.Fatal("ungated did not preserve scores/confidence")
+			}
+		}
+	}
+}
