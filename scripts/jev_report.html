@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Jev · Context comparison</title>
+<style>
+:root{color-scheme:light;--ink:#202b33;--muted:#647078;--line:#dce2e2;--paper:#f4f6f5;--teal:#18756b;--amber:#996215;--blue:#55759f}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1160px;margin:auto;padding:38px 30px 70px}header{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:36px}.brand{font-size:13px;font-weight:650;letter-spacing:.1em;text-transform:uppercase}.brand span{color:var(--muted);font-weight:400}h1{font-size:40px;letter-spacing:-1.3px;line-height:1.15;margin:10px 0 16px;font-weight:620}h2{font-size:19px;margin:0 0 8px}h3{font-size:16px;margin:0 0 8px}p{margin:8px 0}small,.muted{color:var(--muted)}.intro{max-width:810px;font-size:17px;color:var(--muted);margin-bottom:28px}.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap}button,.button{border:1px solid #bdc8c7;border-radius:6px;background:white;color:var(--ink);font:inherit;padding:8px 12px;cursor:pointer;text-decoration:none}button:hover,.button:hover{border-color:var(--teal)}input[type=file]{max-width:250px;font-size:13px}.notice{border-left:3px solid var(--amber);padding:14px 18px;background:#fff8ec;border-radius:0 6px 6px 0;margin:22px 0}.notice strong{color:#754b11}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:22px 0}.card,.panel{background:white;border:1px solid var(--line);border-radius:9px;padding:22px}.metric{font-size:32px;letter-spacing:-1px;font-weight:600;margin:5px 0}.kicker{font-size:12px;letter-spacing:.065em;text-transform:uppercase;color:var(--muted);font-weight:600}.grid{display:grid;grid-template-columns:1.3fr 1fr;gap:18px;margin:22px 0}.panel{margin:18px 0}.grid .panel{margin:0}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}th{text-align:left;font-weight:500;color:var(--muted);padding:12px 10px;border-bottom:1px solid var(--line);white-space:nowrap}td{padding:15px 10px;border-bottom:1px solid #edf0ef;vertical-align:top}th:first-child,td:first-child{padding-left:0}tr:last-child td{border-bottom:0}.pill{display:inline-block;border-radius:4px;padding:3px 7px;background:#e9f3f1;color:var(--teal);font-size:12px;font-weight:600}.pill.warn{background:#fff0d7;color:#8a5913}.pill.neutral{background:#eef1f3;color:var(--muted)}.bar-row{margin:19px 0}.bar-label{display:flex;justify-content:space-between;gap:12px;margin-bottom:7px}.track{height:10px;background:#edf1f1;border-radius:4px;overflow:hidden}.fill{height:100%;background:var(--teal);border-radius:4px}.legend{font-size:12px;color:var(--muted)}details{border:1px solid var(--line);border-radius:7px;margin:12px 0;background:white}summary{cursor:pointer;padding:15px 18px;font-weight:550}details .body{padding:0 18px 18px}code{font:12px/1.5 ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}ul{padding-left:20px}.columns{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}.citation{padding:8px 0;border-bottom:1px solid #edf0ef;font-size:13px}.citation.added{border-left:3px solid var(--teal);padding-left:8px}.citation.lost{border-left:3px solid var(--amber);padding-left:8px}.footer{font-size:12px;color:var(--muted);padding-top:22px;border-top:1px solid var(--line);overflow-wrap:anywhere}.error{color:#ad302d}select{font:inherit;padding:6px;background:white;border:1px solid var(--line);border-radius:5px}
+@media(max-width:800px){main{padding:24px 16px}header{align-items:flex-start;flex-direction:column}h1{font-size:32px}.cards{grid-template-columns:repeat(2,1fr)}.grid,.columns{grid-template-columns:1fr}.metric{font-size:28px}}
+</style></head><body><main>
+<header><div class="brand">shale <span>/ experiments</span></div><div class="toolbar"><label class="button">Load benchmark JSON <input id="file" type="file" accept=".json" hidden></label><a class="button" href="review.html">Review tuning labels ↗</a></div></header>
+<div class="kicker">First-call context · Jev</div><h1>Context comparison</h1><p class="intro" id="intro"></p><p id="error" class="error" role="alert"></p>
+<div id="report"></div>
+</main>
+<script id="data" type="application/json">__REPORT_JSON__</script>
+<script>
+'use strict';
+const E=(tag,text,parent,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;if(parent)parent.append(n);return n};
+const names={baseline:'Local baseline',jev_gated:'Jev · confidence gate',jev_ungated:'Jev · no confidence gate'};
+const num=v=>typeof v==='number'&&Number.isFinite(v)?v:0;
+const q=(a,p)=>{const x=a.filter(v=>typeof v==='number'&&Number.isFinite(v)).sort((a,b)=>a-b);return x.length?x[Math.max(0,Math.ceil(x.length*p)-1)]:null};
+const avg=a=>a.length?a.reduce((s,v)=>s+v,0)/a.length:null;
+const ms=v=>v===null||v===undefined?'—':v<1?v.toFixed(3)+' ms':Math.round(v).toLocaleString()+' ms';
+const pct=v=>v===null||v===undefined?'—':Math.round(v*100)+'%';
+function normalize(data){
+ if(Array.isArray(data.trials)&&data.trials.every(t=>Array.isArray(t.results))){return {shared:true,trials:data.trials.map(t=>({...t,results:t.results.map(r=>({...r,time:r.estimatedStandaloneAssemblyMs}))}))};}
+ if(Array.isArray(data.attempts)){
+  const trials=new Map();for(const a of data.attempts){const key=a.caseId+'|'+a.repeat;let t=trials.get(key);if(!t){t={caseId:a.caseId,repeat:a.repeat,mode:a.mode,split:a.split,reviewed:a.reviewed,candidateCount:a.candidateCount,results:[]};trials.set(key,t)}
+   if(a.variant==='jev'){t.call=a.reranking;t.initialNetworkAttempt=a.initialConnection;}
+   t.results.push({policy:a.variant==='jev'?'jev_gated':a.variant,time:a.assemblyMs,status:a.reranking?.status||'local',reason:a.reranking?.reason,sections:a.reranking?.sections,accuracy:a.accuracy,citations:a.citations,usedTokens:a.usedTokens});
+  }return {shared:false,trials:[...trials.values()]};
+ }throw Error('Load a shale-bench run or compare result JSON. A suite or batching result is a different file.');
+}
+function render(data,suite){
+ const normalized=normalize(data),trials=normalized.trials;if(!trials.length)throw Error('This report has no benchmark attempts.');
+ const root=document.getElementById('report');root.replaceChildren();
+ const sourceCases=new Map((suite?.cases||[]).map(c=>[c.id,c]));const evidence=new Map();for(const c of suite?.cases||[]){for(const a of Object.values(c.candidates.packet.sections).flat())evidence.set(a.ref,a)}
+ const taskIds=[...new Set(trials.map(t=>t.caseId))];const calls=trials.filter(t=>num(t.call?.httpMs)>0);const warm=calls.filter(t=>!t.initialNetworkAttempt);const byPolicy={};for(const t of trials)for(const r of t.results)(byPolicy[r.policy]??=[]).push({...r,caseId:t.caseId,reviewed:t.reviewed});
+ const policies=['baseline','jev_gated','jev_ungated'];const reviewed=taskIds.filter(id=>trials.some(t=>t.caseId===id&&t.reviewed));
+ document.getElementById('intro').textContent=normalized.shared?'Baseline, gated Jev, and ungated Jev use identical candidates. Both Jev policies share one scoring call per task/repeat.':'Your live smoke test, shown side by side. This run tested the current confidence gate; ungated Jev has not been run.';
+ const notice=E('div',undefined,root,'notice');E('strong',reviewed.length?'Labels reviewed for '+reviewed.length+' task(s).':'Accuracy is not established yet.',notice);E('p',reviewed.length?'Read required-context recall and critical omissions together. Tuning results help choose a policy; they do not validate it on unseen tasks.':'These calls verify integration and latency. Review the tuning labels before using relevance scores to choose a policy.',notice);
+ const cards=E('div',undefined,root,'cards');
+ function card(label,value,detail){const c=E('div',undefined,cards,'card');E('div',label,c,'kicker');E('div',value,c,'metric');E('small',detail,c)}
+ card('Live calls',String(calls.length),taskIds.length+' tasks · counted once per request');
+ card('Warm HTTP · p50',ms(q(warm.map(t=>t.call.httpMs),.5)),warm.length+' calls after the first request');
+ const gated=byPolicy.jev_gated||[];const applied=gated.filter(r=>r.status==='applied').length;
+ card('Gate fully applied',applied+' / '+gated.length,gated.filter(r=>r.status==='partial').length+' partial · '+gated.filter(r=>r.status==='fallback').length+' fallback');
+ card('Reviewed tasks',reviewed.length+' / '+taskIds.length,reviewed.length?'Use the task-level accuracy below':'Draft labels are excluded from reviewed accuracy');
+ const grid=E('div',undefined,root,'grid');const latency=E('div',undefined,grid,'panel');E('h2','Time added by context selection',latency);E('p',normalized.shared?'Estimated standalone assembly = shared scoring time + local policy replay.':'Measured assembly time, including Jev where enabled. Local retrieval is excluded.',latency,'muted');
+ const medians=policies.map(p=>q((byPolicy[p]||[]).map(r=>r.time),.5));const max=Math.max(...medians.map(num),1);
+ for(let i=0;i<policies.length;i++){const row=E('div',undefined,latency,'bar-row');const label=E('div',undefined,row,'bar-label');E('span',names[policies[i]],label);E('strong',byPolicy[policies[i]]?ms(medians[i]):'Not run',label);const track=E('div',undefined,row,'track');const fill=E('div',undefined,track,'fill');fill.style.width=Math.max(0,Math.min(100,num(medians[i])/max*100))+'%';if(i===0)fill.style.background='var(--blue)';}
+ E('p','Bars show p50. Shared scoring is never counted twice in request totals.',latency,'legend');
+ const net=E('div',undefined,grid,'panel');E('h2','Provider latency',net);const nt=E('table',undefined,net);const nh=E('tr',undefined,E('thead',undefined,nt));for(const h of ['Requests','n','p50','p95'])E('th',h,nh);const nb=E('tbody',undefined,nt);for(const [label,list]of [['All calls',calls],['First request',calls.filter(t=>t.initialNetworkAttempt)],['Warm client',warm]]){const tr=E('tr',undefined,nb);for(const v of [label,String(list.length),ms(q(list.map(t=>t.call.httpMs),.5)),ms(q(list.map(t=>t.call.httpMs),.95))])E('td',v,tr)}
+ E('p','Small-sample p95 is descriptive; with four calls it is the maximum. “Warm” means client reuse, not a guaranteed open connection.',net,'legend');
+ const panel=E('div',undefined,root,'panel');E('h2','Policy outcomes',panel);const wrap=E('div',undefined,panel,'table-wrap');const table=E('table',undefined,wrap);const h=E('tr',undefined,E('thead',undefined,table));for(const title of ['Policy','p50 / p95','Applied / partial / fallback','Required recall','Irrelevant tokens'])E('th',title,h);const body=E('tbody',undefined,table);
+ for(const policy of policies){const rows=byPolicy[policy];const tr=E('tr',undefined,body);E('td',names[policy],tr);if(!rows){const td=E('td','Not run',tr);td.colSpan=4;td.className='muted';continue}
+  E('td',ms(q(rows.map(r=>r.time),.5))+' / '+ms(q(rows.map(r=>r.time),.95)),tr);
+  E('td',policy==='baseline'?'Local only':[rows.filter(r=>r.status==='applied').length,rows.filter(r=>r.status==='partial').length,rows.filter(r=>r.status==='fallback'||r.status==='skipped').length].join(' / '),tr);
+  const labeled=rows.filter(r=>r.reviewed&&r.accuracy);const perTask=field=>taskIds.map(id=>avg(labeled.filter(r=>r.caseId===id).map(r=>num(r.accuracy[field])))).filter(v=>v!==null);
+  E('td',pct(avg(perTask('requiredRecall'))),tr);E('td',pct(avg(perTask('irrelevantTokenFraction'))),tr);
+ }
+ E('p','Accuracy cells use reviewed labels only, averaged by task. A dash means no reviewed measurement—not zero accuracy.',panel,'legend');
+ E('h2','Inspect each task',root);E('p','Select a repeat to inspect its citations, additions and omissions. Green marks added refs; amber marks refs lost relative to the baseline.',root,'muted');
+ for(const id of taskIds){const runs=trials.filter(t=>t.caseId===id).sort((a,b)=>a.repeat-b.repeat);const details=E('details',undefined,root);const c=sourceCases.get(id);E('summary',id+(c?' · '+c.candidates.packet.task.slice(0,95):''),details);const body=E('div',undefined,details,'body');if(c)E('p',c.candidates.packet.task,body);E('p',runs[0].candidateCount+' candidates · '+runs.length+' repeat(s) · '+runs[0].mode+' · '+runs[0].split,body,'muted');
+  const label=E('label','Repeat ',body);const select=E('select',undefined,label);runs.forEach((t,i)=>{const option=E('option',String(t.repeat+1),select);option.value=String(i)});const area=E('div',undefined,body);
+  const show=()=>{area.replaceChildren();const t=runs[Number(select.value)];const base=new Set(t.results.find(r=>r.policy==='baseline')?.citations||[]);const columns=E('div',undefined,area,'columns');for(const policy of policies){const col=E('div',undefined,columns);E('h3',names[policy],col);const r=t.results.find(r=>r.policy===policy);if(!r){E('span','Not run',col,'pill neutral');continue}
+    E('span',r.status+(r.reason?' · '+r.reason:''),col,'pill '+(r.status==='fallback'||r.status==='partial'?'warn':''));E('p',r.usedTokens+' estimated tokens',col,'muted');if(r.accuracy){E('p',(t.reviewed?'Reviewed':'Draft')+' recall: '+pct(r.accuracy.requiredRecall),col);E('p','Critical refs missing: '+r.accuracy.missingCritical.length,col)}
+    if(r.sections)E('p',Object.entries(r.sections).map(([s,v])=>s+': '+v).join(' · '),col,'legend');
+    const included=new Set(r.citations||[]);for(const ref of r.citations||[]){const item=E('div',undefined,col,'citation '+(policy!=='baseline'&&!base.has(ref)?'added':''));E('div',evidence.get(ref)?.title||ref,item);if(evidence.has(ref))E('code',ref,item)}
+    if(policy!=='baseline'){for(const ref of base)if(!included.has(ref)){const item=E('div',undefined,col,'citation lost');E('div','Omitted: '+(evidence.get(ref)?.title||ref),item);E('code',ref,item)}}
+   }};select.onchange=show;show();
+ }
+ const footer=E('div',undefined,root,'footer');E('p','Model: '+(data.configuredModel||'recorded per call')+' · Prompt: '+(data.promptVersion||'—')+' · Commit: '+(data.commit||'—').slice(0,12),footer);E('p','Suite hash: '+(data.suiteHash||'—'),footer);E('p','This report stays in your browser. Loading JSON makes no network requests. No task-completion speed or accuracy improvement is implied by latency alone.',footer);
+}
+const embedded=JSON.parse(document.getElementById('data').textContent);try{render(embedded.result,embedded.suite)}catch(e){document.getElementById('error').textContent=e.message}
+document.getElementById('file').onchange=async event=>{try{const file=event.target.files[0];if(!file)return;const data=JSON.parse(await file.text());normalize(data);render(data,embedded.suite);document.getElementById('error').textContent='';}catch(e){document.getElementById('error').textContent=e.message}};
+</script></body></html>
