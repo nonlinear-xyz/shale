@@ -7,3 +7,7 @@
 *.out
 
 .DS_Store
+
+# Developer benchmark binary and Python caches
+/shale-bench
+__pycache__/

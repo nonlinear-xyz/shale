@@ -5,7 +5,8 @@ Local memory for coding agents.
 Your agents forget everything, and each new one starts from zero. shale captures
 agent sessions, stores explicit memories and task handoffs, indexes the memory
 files your harnesses already maintain, and serves the useful slice back to any
-agent over MCP. The entire loop is local and model-free.
+agent over MCP. The default loop is local and model-free. Optional Jev reranking
+orders context candidates by estimated task relevance before packing.
 
 ```sh
 shale                    # open the browser
@@ -248,9 +249,15 @@ scrubbed transcript and artifact blobs under `~/.shale`. There is no account, no
 daemon phoning home, and no LLM call — retrieval is FTS5 keyword search over your
 own corpus.
 
-`shale link` is the only command that involves a server, and it is the upgrade
-path, not the product. What it buys is the thing you cannot compute on one
-machine: joins across machines, across repositories, and across people.
+`shale mcp` can optionally call TypeSafe to rerank context candidates when
+`SHALE_CONTEXT_RERANKER=jev` and `TYPESAFE_API_KEY` are explicitly configured.
+This sends the task and scrubbed candidate excerpts to the hosted API. The
+default remains local; a key alone does not enable it. See the
+[Jev integration and real-data benchmark](docs/jev-benchmark.md) for setup,
+latency/accuracy evaluation, and fallback behavior.
+
+`shale link` is the cross-machine upgrade path. What it buys is the thing you
+cannot compute on one machine: joins across machines, across repositories, and across people.
 
 Before any of that, `shale repos` shows you the complete list of what this tool
 can see, and nothing is uploaded until you say so. Discovery is local, sync is

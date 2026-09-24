@@ -1,9 +1,9 @@
 // Command shale is the local memory layer for coding agents.
 //
 // It captures agent sessions from whatever harness wrote them, keeps them in a
-// local append-only store, and serves them back to any agent over MCP. It never
-// calls an LLM locally, never parses source code, and is read-only on the
-// filesystem outside its own state directory (~/.shale).
+// local append-only store, and serves them back to any agent over MCP. Model calls
+// require explicit configuration. It never parses source code and is read-only
+// on the filesystem outside its own state directory (~/.shale).
 //
 // Interpretation — distillation, entity resolution, cross-machine joins — happens
 // on a hub, where it can be rewritten without shipping a new binary to anyone.
@@ -28,6 +28,7 @@ import (
 	"github.com/nonlinear-xyz/shale/internal/buildinfo"
 	"github.com/nonlinear-xyz/shale/internal/config"
 	"github.com/nonlinear-xyz/shale/internal/discover"
+	"github.com/nonlinear-xyz/shale/internal/jev"
 	"github.com/nonlinear-xyz/shale/internal/mcp"
 	"github.com/nonlinear-xyz/shale/internal/render"
 	"github.com/nonlinear-xyz/shale/internal/scrub"
@@ -505,13 +506,17 @@ func cmdMCP(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	ranker, err := jev.FromEnv()
+	if err != nil {
+		return err
+	}
 	db, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	srv := &mcp.Server{DB: db, Log: os.Stderr}
+	srv := &mcp.Server{DB: db, Log: os.Stderr, Reranker: ranker}
 	return srv.Serve(ctx, os.Stdin, os.Stdout)
 }
 
