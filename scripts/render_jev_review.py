@@ -29,7 +29,7 @@ label{display:inline-block;margin:8px 16px 8px 0}select,button{font:inherit;padd
 <div id="cases"></div>
 <script id="suite" type="application/json">__SUITE_JSON__</script>
 <script>
-const suite=JSON.parse(document.getElementById('suite').textContent());
+const suite=JSON.parse(document.getElementById('suite').textContent);
 const el=(tag,text,parent)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(parent)parent.append(n);return n};
 const selections=new Map();
 function refresh(){document.getElementById('status').textContent=suite.cases.filter(c=>c.reviewed).length+' / '+suite.cases.length+' cases reviewed';}

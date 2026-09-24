@@ -151,3 +151,67 @@ CGO_ENABLED=0 go test ./internal/pack ./internal/jev -run '^$' -bench . -benchme
 The Go benchmarks measure local overhead only. Client tests use controlled
 transports to verify batching, deadline enforcement, and failure handling; they
 cannot establish real Jev latency or accuracy.
+
+## Compare the confidence gate using shared scores
+
+`compare` evaluates **baseline**, **jev_gated** (the current 0.6 section veto), and
+**jev_ungated**. It defaults to the tuning split and makes one provider call per
+case/repetition, then replays the same scores, confidence values, and errors into
+both policies. Production `context_for_task` still uses the original gate.
+Malformed or failed provider responses fall back in both policies.
+
+First review the task and source-based labels, without looking at Jev scores:
+
+```sh
+python3 scripts/render_jev_review.py --suite /path/suite-draft.json \
+  --output /path/review.html
+open /path/review.html
+```
+
+The offline sheet shows draft judgments and supporting excerpts when the suite
+has `labelEvidence` entries. Edit the classifications and critical flags, check
+the task and case review boxes, then **Download reviewed suite**. Nothing is
+uploaded or written back to the original file. Changing a label clears that
+case's reviewed status. These controls record your judgment; they are not an
+independent check that a label is correct.
+
+With `TYPESAFE_API_KEY` set:
+
+```sh
+CGO_ENABLED=0 go build -o /tmp/shale-bench ./cmd/shale-bench
+/tmp/shale-bench compare --suite /path/jev-tuning-reviewed.json \
+  --output /path/comparison.json --repeats 5
+```
+
+The comparison records actual scoring/network time once and distinguishes local
+policy replay time from estimated standalone assembly time (shared scoring plus
+replay). Each policy reports required-reference recall, irrelevant-token fraction,
+critical omissions, and inclusion consistency; the three paired contrasts are
+reported independently. Reviewed tuning results remain `tuning_only`. Choose a
+policy before running `--split heldout`; do not repurpose held-out cases for tuning.
+
+The initial private review artifact contains six **authored memory probes** over
+an eight-memory project-scoped pool. These are real source memories with drafted
+tasks and labels; they are not historical user requests or lexical-retrieval
+results. Their `curated_memory_probe` mode keeps them separate from production
+retrieval evaluation. They diagnose policy behavior under a fixed token budget;
+validate the eventual choice on independently labeled, untouched retrieval cases.
+
+## View results in HTML
+
+```sh
+python3 scripts/render_jev_report.py --results /path/comparison.json \
+  --suite /path/jev-tuning-reviewed.json --output /path/comparison.html
+open /path/comparison.html
+```
+
+The report supports both the original `run` JSON and the three-policy `compare`
+JSON. It displays actual provider p50/p95, policy outcomes, reviewed accuracy,
+and per-task citations added or lost against the baseline. The optional suite
+provides task text and source titles. Its **Load benchmark JSON** button lets you
+view another run without rebuilding; unknown task refs remain visible by ID.
+The **Review tuning labels** link expects `review.html` in the same directory.
+
+Both artifacts are self-contained and make no network requests. Keep generated
+HTML, private suites, and results outside the repository. Missing measurements
+are displayed as not run or unreviewed, rather than as zero accuracy.
